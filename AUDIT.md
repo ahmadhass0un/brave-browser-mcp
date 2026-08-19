@@ -58,3 +58,6 @@
 | 37 | LLM blind to complex UIs (dialogs, token chips) | ✅ Added `list_elements` (interactive elements + reusable selectors), `inspect_dom` (structure/attrs/children), `focus_element` (focus via selector or text, honest focus-state report), `press_key` (keys/combos/sequences); added `scope` param to `click`, `type`, `list_elements`, `inspect_dom`, `focus_element` |
 | 38 | `click` silently succeeded on missing selectors | ✅ Now errors with guidance; JS-click fallback only when overlay intercepts real click; `by_text` also matches `aria-label` |
 | 39 | `navigate_history` hung ~45s on bfcache pages | ✅ Uses `history.back()/forward()` + URL-poll + settle; ~1.3s |
+| 40 | **1s polling CAPTCHA wait (high CPU)** | ✅ `waitForCaptchaSolved()` waits via MutationObserver (`polling:"mutation"`) with a 5s safety poll instead of 1s full-DOM polling |
+| 41 | **`detectCaptcha` serialized full DOM** | ✅ Removed `document.documentElement.outerHTML` and `getComputedStyle` loops; uses targeted selectors + `offsetWidth/offsetHeight` visibility checks |
+| 42 | **WebSocket-per-tab in `windows list`** | ✅ Reuses the single browser-level CDP session (`Target.getTargets` + `Browser.getWindowForTarget`); falls back to one pooled WS if no session |

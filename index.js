@@ -147,7 +147,6 @@ async function detectCaptcha() {
   try {
     return await currentPage.evaluate(() => {
       const body = document.body?.innerText?.toLowerCase() || "";
-      const html = document.documentElement.outerHTML.toLowerCase();
       const url = window.location.href.toLowerCase();
 
       if (url.includes("captcha") || url.includes("recaptcha") || url.includes("challenge")) {
@@ -156,10 +155,11 @@ async function detectCaptcha() {
         }
       }
 
-      if (html.includes("cloudflare") && html.includes("challenge")) {
-        const cf = document.querySelector('#challenge-form, #challenge-running, #challenge-stage');
-        if (cf) return { found: true, type: "Cloudflare challenge", solved: false };
-        if (!body.includes("checking your browser") && !body.includes("verify you")) return { found: false, solved: true };
+      const cf = document.querySelector('#challenge-form, #challenge-running, #challenge-stage');
+      if (cf) return { found: true, type: "Cloudflare challenge", solved: false };
+      const hasCloudflare = document.querySelector('script[src*="challenges.cloudflare.com"], script[src*="cloudflare"]');
+      if (hasCloudflare && !body.includes("checking your browser") && !body.includes("verify you")) {
+        return { found: false, solved: true };
       }
 
       const recaptcha = document.querySelector('iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]');
@@ -167,10 +167,7 @@ async function detectCaptcha() {
         const cb = document.querySelector('.recaptcha-checkbox, #recaptcha-anchor');
         if (cb) return { found: true, type: "reCAPTCHA", solved: cb.getAttribute('aria-checked') === 'true' };
         const bframe = document.querySelector('iframe[src*="recaptcha/bframe"]');
-        if (bframe) {
-          const s = window.getComputedStyle(bframe);
-          if (s.display !== 'none' && s.visibility !== 'hidden') return { found: true, type: "reCAPTCHA challenge", solved: false };
-        }
+        if (bframe && bframe.offsetWidth > 0) return { found: true, type: "reCAPTCHA challenge", solved: false };
         return { found: true, type: "reCAPTCHA", solved: false };
       }
 
@@ -194,8 +191,7 @@ async function detectCaptcha() {
 
       const containers = document.querySelectorAll('[class*="captcha"], [id*="captcha"], [class*="challenge"], [id*="challenge"]');
       for (const c of containers) {
-        const s = window.getComputedStyle(c);
-        if (s.display !== 'none' && s.visibility !== 'hidden' && c.offsetHeight > 0) return { found: true, type: "CAPTCHA container", solved: false };
+        if (c.offsetWidth > 0 && c.offsetHeight > 0) return { found: true, type: "CAPTCHA container", solved: false };
       }
 
       return { found: false, solved: false };
@@ -206,16 +202,60 @@ async function detectCaptcha() {
   }
 }
 
+function captchaResolvedPredicate() {
+  const recaptcha = document.querySelector('iframe[src*="recaptcha"], iframe[title*="reCAPTCHA"]');
+  if (recaptcha) {
+    const cb = document.querySelector('.recaptcha-checkbox, #recaptcha-anchor');
+    if (cb) return cb.getAttribute('aria-checked') === 'true';
+    return false;
+  }
+  const hcaptcha = document.querySelector('iframe[src*="hcaptcha"], .h-captcha');
+  if (hcaptcha) {
+    const cb = document.querySelector('#checkbox');
+    if (cb) return cb.classList.contains('checked');
+    return false;
+  }
+  const turnstile = document.querySelector('iframe[src*="turnstile"], [class*="cf-turnstile"]');
+  if (turnstile) return !!document.querySelector('input[name="cf-turnstile-response"]')?.value;
+  if (document.querySelector('#challenge-form, #challenge-running, #challenge-stage')) return false;
+  const containers = document.querySelectorAll('[class*="captcha"], [id*="captcha"], [class*="challenge"], [id*="challenge"]');
+  for (const c of containers) {
+    if (c.offsetWidth > 0 && c.offsetHeight > 0) return false;
+  }
+  return true;
+}
+
+async function waitForCaptchaSolved(timeoutMs = 120000) {
+  if (!currentPage) return { solved: false, seconds: 0 };
+  const startTime = Date.now();
+  let done = false;
+  const markDone = () => { done = true; };
+
+  const mutationWait = currentPage.waitForFunction(captchaResolvedPredicate, { polling: "mutation", timeout: timeoutMs })
+    .then(() => true)
+    .catch(() => false);
+
+  const fallback = (async () => {
+    while (!done && Date.now() - startTime < timeoutMs) {
+      await new Promise(r => setTimeout(r, 5000));
+      if (done) return false;
+      const check = await detectCaptcha();
+      if (!check?.found || check.solved) return true;
+    }
+    return false;
+  })();
+
+  const solved = await Promise.race([mutationWait, fallback]);
+  markDone();
+  return { solved, seconds: Math.round((Date.now() - startTime) / 1000) };
+}
+
 async function autoWaitForCaptcha() {
   const info = await detectCaptcha();
   if (!info?.found || info.solved) return info?.found ? `${info.type} [SOLVED]` : null;
-  const startTime = Date.now();
-  while (Date.now() - startTime < 120000) {
-    await new Promise(r => setTimeout(r, 1000));
-    const check = await detectCaptcha();
-    if (!check?.found || check.solved) return `${info.type} solved in ${Math.round((Date.now() - startTime) / 1000)}s`;
-  }
-  return `${info.type} [TIMEOUT]`;
+  const result = await waitForCaptchaSolved(120000);
+  if (!result.solved) return `${info.type} [TIMEOUT]`;
+  return `${info.type} solved in ${result.seconds}s`;
 }
 
 function cleanup() {
@@ -773,49 +813,75 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
 
         async function getWindowsFromPort(port) {
           try {
-            const targets = await fetch(`http://localhost:${port}/json`).then(r => r.json()).catch(() => []);
-            const pages = targets.filter(t => t.type === "page" && t.webSocketDebuggerUrl);
-            const windowMap = new Map();
-
-            for (const t of pages) {
-              let ws = null;
-              try {
-                const result = await new Promise((resolve, reject) => {
-                  ws = new WebSocket(t.webSocketDebuggerUrl);
-                  const timeout = setTimeout(() => { try { ws?.close(); } catch {} reject("timeout"); }, 3000);
-                  ws.on("open", () => {
-                    ws.send(JSON.stringify({ id: 1, method: "Browser.getWindowForTarget" }));
-                  });
-                  ws.on("message", (data) => {
-                    try {
-                      const msg = JSON.parse(data.toString());
-                      if (msg.id === 1) {
-                        clearTimeout(timeout);
-                        try { ws?.close(); } catch {}
-                        resolve(msg.result);
-                      }
-                    } catch {}
-                  });
-                  ws.on("error", () => { clearTimeout(timeout); reject("error"); });
-                  ws.on("close", () => { clearTimeout(timeout); });
-                });
-
-                if (result?.windowId) {
-                  if (!windowMap.has(result.windowId)) windowMap.set(result.windowId, { tabs: [], windowId: result.windowId });
-                  windowMap.get(result.windowId).tabs.push({ url: t.url, title: t.title, id: t.id });
+            let windowMap = new Map();
+            if (cdpSession) {
+              const { targetInfos } = await cdpSession.send("Target.getTargets");
+              const pages = targetInfos.filter(t => t.type === "page");
+              for (const t of pages) {
+                try {
+                  const { windowId } = await cdpSession.send("Browser.getWindowForTarget", { targetId: t.targetId });
+                  if (windowId) {
+                    if (!windowMap.has(windowId)) windowMap.set(windowId, { tabs: [], windowId });
+                    windowMap.get(windowId).tabs.push({ url: t.url, title: t.title, id: t.targetId });
+                  }
+                } catch {
+                  const unknownId = "unknown";
+                  if (!windowMap.has(unknownId)) windowMap.set(unknownId, { tabs: [], windowId: unknownId });
+                  windowMap.get(unknownId).tabs.push({ url: t.url, title: t.title, id: t.targetId });
                 }
-              } catch {
-                try { ws?.close(); } catch {}
-                const unknownId = "unknown";
-                if (!windowMap.has(unknownId)) windowMap.set(unknownId, { tabs: [], windowId: unknownId });
-                windowMap.get(unknownId).tabs.push({ url: t.url, title: t.title, id: t.id });
+              }
+            } else {
+              const targets = await fetch(`http://localhost:${port}/json`).then(r => r.json()).catch(() => []);
+              const pages = targets.filter(t => t.type === "page" && t.webSocketDebuggerUrl);
+              const version = await fetch(`http://localhost:${port}/json/version`).then(r => r.json()).catch(() => null);
+              const wsUrl = version?.webSocketDebuggerUrl;
+              if (!wsUrl) throw new Error("no browser websocket");
+              const ws = new WebSocket(wsUrl);
+              let nextId = 1;
+              const pending = new Map();
+              await new Promise((resolve, reject) => {
+                const to = setTimeout(() => reject(new Error("ws timeout")), 3000);
+                ws.on("open", () => { clearTimeout(to); resolve(); });
+                ws.on("error", (e) => { clearTimeout(to); reject(e); });
+              });
+              ws.on("message", (data) => {
+                try {
+                  const msg = JSON.parse(data.toString());
+                  if (msg.id && pending.has(msg.id)) {
+                    pending.get(msg.id)(msg);
+                    pending.delete(msg.id);
+                  }
+                } catch {}
+              });
+              const send = (method, params) => new Promise((resolve, reject) => {
+                const id = nextId++;
+                const to = setTimeout(() => { pending.delete(id); reject(new Error("cdp timeout")); }, 3000);
+                pending.set(id, (msg) => { clearTimeout(to); msg.error ? reject(new Error(msg.error.message)) : resolve(msg.result); });
+                ws.send(JSON.stringify({ id, method, params }));
+              });
+              try {
+                for (const t of pages) {
+                  try {
+                    const { windowId } = await send("Browser.getWindowForTarget", { targetId: t.id });
+                    if (windowId) {
+                      if (!windowMap.has(windowId)) windowMap.set(windowId, { tabs: [], windowId });
+                      windowMap.get(windowId).tabs.push({ url: t.url, title: t.title, id: t.id });
+                    }
+                  } catch {
+                    const unknownId = "unknown";
+                    if (!windowMap.has(unknownId)) windowMap.set(unknownId, { tabs: [], windowId: unknownId });
+                    windowMap.get(unknownId).tabs.push({ url: t.url, title: t.title, id: t.id });
+                  }
+                }
+              } finally {
+                try { ws.close(); } catch {}
               }
             }
 
             for (const [, win] of windowMap) {
               allWindows.push(win);
             }
-          } catch {}
+          } catch (e) { log(`getWindowsFromPort: ${e.message}`); }
         }
 
         await getWindowsFromPort(BROWSER_PORT);
@@ -874,19 +940,16 @@ server.tool("detect_captcha", "Check whether the current page shows a CAPTCHA an
   } catch (e) { return textErr(`Error: ${e.message}`); }
 });
 
-server.tool("wait_for_captcha", "Poll every 1 second for the current page's CAPTCHA to be solved by the user. Use after detect_captcha finds an unsolved CAPTCHA — wait for the user to solve it, then continue automation.", {
+server.tool("wait_for_captcha", "Wait for the current page's CAPTCHA to be solved by the user. Uses DOM-change detection (event-driven via MutationObserver) with a slow 5s safety poll, so it wastes almost no CPU while waiting. Use after detect_captcha finds an unsolved CAPTCHA — wait for the user to solve it, then continue automation.", {
   timeout: z.number().optional().default(120).describe("Max seconds to wait for the CAPTCHA to be solved (default 120)"),
 }, async ({ timeout }) => {
   try {
     const page = requirePage();
-    const startTime = Date.now();
-    const maxMs = timeout * 1000;
-    while (Date.now() - startTime < maxMs) {
-      const info = await detectCaptcha();
-      if (!info?.found) return text("No CAPTCHA detected on this page");
-      if (info.solved) return text(`CAPTCHA solved (${info.type}) in ${Math.round((Date.now() - startTime) / 1000)}s`);
-      await new Promise(r => setTimeout(r, 1000));
-    }
+    const info = await detectCaptcha();
+    if (!info?.found) return text("No CAPTCHA detected on this page");
+    if (info.solved) return text(`CAPTCHA solved (${info.type}) in 0s`);
+    const result = await waitForCaptchaSolved(timeout * 1000);
+    if (result.solved) return text(`CAPTCHA solved (${info.type}) in ${result.seconds}s`);
     return text(`Timeout: CAPTCHA not solved within ${timeout}s`);
   } catch (e) { return textErr(`Error: ${e.message}`); }
 });
