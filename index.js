@@ -312,14 +312,18 @@ server.tool("navigate", "Navigate the current tab to a URL. Waits for the page t
   } catch (e) { return textErr(`Error navigating: ${e.message}`); }
 });
 
-server.tool("navigate_history", "Go back or forward in the current tab's history. Auto-detects CAPTCHAs after navigating. Fails gracefully if there is no history entry in that direction.", {
+server.tool("navigate_history", "Go back or forward in the current tab's history. Auto-detects CAPTCHAs after navigating. Fails gracefully if there is no history entry in that direction. Uses the browser's history API and polls for the URL change, so it returns fast even when pages restore from the back/forward cache (which never fire load events).", {
   action: z.enum(["back", "forward"]).describe("Direction: back to previous page, forward to next page"),
 }, async ({ action }) => {
   try {
     const page = requirePage();
-    if (action === "back") await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-    else await page.goForward({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-    await waitForPageReady(page);
+    const beforeUrl = page.url();
+    await page.evaluate((dir) => { try { history[dir](); } catch {} }, action === "back" ? "back" : "forward");
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 300));
+      if (page.url() !== beforeUrl) break;
+    }
+    await new Promise(r => setTimeout(r, 1000));
     let result = `${action === "back" ? "Back" : "Forward"} to: ${page.url()}`;
     const captchaResult = await autoWaitForCaptcha();
     if (captchaResult) result += `\nCAPTCHA: ${captchaResult}`;
@@ -327,48 +331,149 @@ server.tool("navigate_history", "Go back or forward in the current tab's history
   } catch (e) { return textErr(`Error navigating: ${e.message}`); }
 });
 
-server.tool("click", "Click an element on the current page. By default uses a CSS selector; set by_text=true to match by visible text instead. Supports double-click and left/right/middle mouse buttons. Falls back to a JS click if the selector is not found. Auto-detects CAPTCHAs afterward.", {
-  selector: z.string().describe("CSS selector (e.g. '#submit', '.btn', 'a[href*=\"/login\"]') OR visible text when by_text=true"),
-  by_text: z.boolean().optional().default(false).describe("True: match by visible text content instead of CSS selector"),
+server.tool("click", "Click an element on the current page. By default uses a CSS selector; set by_text=true to match by visible text OR aria-label instead. Supports double-click and left/right/middle mouse buttons. If a real mouse click is blocked (e.g. by a dialog backdrop or overlay), it retries with a JavaScript click, and the error message hints at what element is intercepting the click. Use scope to click inside an open dialog or container.", {
+  selector: z.string().describe("CSS selector (e.g. '#submit', '.btn', 'a[href*=\"/login\"]') OR visible text / aria-label when by_text=true"),
+  by_text: z.boolean().optional().default(false).describe("True: match by visible text content or aria-label instead of CSS selector"),
+  scope: z.string().optional().describe("CSS selector of a container to search within (e.g. '[role=dialog]' for the currently open dialog)"),
   double_click: z.boolean().optional().default(false).describe("Perform a double-click instead of a single click"),
   button: z.enum(["left", "right", "middle"]).optional().default("left").describe("Mouse button to use (left by default)"),
-}, async ({ selector, by_text, double_click, button }) => {
+}, async ({ selector, by_text, scope, double_click, button }) => {
+  const page = requirePage();
+  const scoped = scope ? page.locator(scope).first() : null;
   try {
-    const page = requirePage();
     await waitForPageReady(page);
+    let clicked = false;
+    let found = false;
     if (by_text) {
-      const loc = page.getByText(selector).first();
-      if (double_click) await loc.dblclick({ force: true, button, timeout: 5000 });
-      else await loc.click({ force: true, button, timeout: 5000 });
-    } else {
-      let clicked = false;
-      for (const sel of [selector]) {
-        try { const el = page.locator(sel).first(); if (await el.count() > 0) { if (double_click) await el.dblclick({ force: true, button, timeout: 3000 }); else await el.click({ force: true, button, timeout: 3000 }); clicked = true; break; } } catch { continue; }
+      const loc = (scoped || page).getByText(selector, { exact: true }).first();
+      const alt = (scoped || page).locator(`[aria-label="${selector.replace(/"/g, '\\"')}"]`).first();
+      const locCount = await loc.count();
+      const altCount = await alt.count();
+      const el = locCount > 0 ? loc : alt;
+      found = locCount > 0 || altCount > 0;
+      if (found) {
+        try {
+          if (double_click) await el.dblclick({ force: true, button, timeout: 5000 });
+          else await el.click({ force: true, button, timeout: 5000 });
+          clicked = true;
+        } catch {
+          await el.evaluate((n) => n.click()).catch(() => {});
+          clicked = true;
+        }
       }
-      if (!clicked) await page.evaluate((sel) => { const el = document.querySelector(sel); if (el) el.click(); }, selector);
+    } else {
+      const el = (scoped || page).locator(selector).first();
+      found = await el.count() > 0;
+      if (found) {
+        try {
+          if (double_click) await el.dblclick({ force: true, button, timeout: 3000 });
+          else await el.click({ force: true, button, timeout: 3000 });
+          clicked = true;
+        } catch {
+          await el.evaluate((n) => n.click()).catch(() => {});
+          clicked = true;
+        }
+      }
+      if (!clicked) {
+        const didJs = await page.evaluate(([sel, scp]) => {
+          const root = scp ? document.querySelector(scp) : document;
+          if (!root) return false;
+          const el = root.querySelector(sel);
+          if (el) { el.click(); return true; }
+          return false;
+        }, [selector, scope || null]);
+        if (didJs) clicked = true;
+      }
+    }
+    if (!found && !clicked) {
+      return textErr(`Element not found: ${selector}${scope ? ` inside "${scope}"` : ""}. Use list_elements to see what's on the page, or inspect_dom to explore the structure.`);
     }
     await waitForPageReady(page);
     let result = `Clicked: ${selector}`;
     const captchaResult = await autoWaitForCaptcha();
     if (captchaResult) result += `\nCAPTCHA: ${captchaResult}`;
     return text(result);
-  } catch (e) { return textErr(`Error clicking: ${e.message}`); }
+  } catch (e) {
+    let hint = "";
+    try {
+      const diag = await page.evaluate(([sel, scp]) => {
+        const root = scp ? document.querySelector(scp) : document;
+        if (!root) return null;
+        let el = null;
+        try { el = root.querySelector(sel); } catch {}
+        if (!el) el = [...root.querySelectorAll("button, [role='button'], a")].find(b => (b.innerText || "").trim() === sel || b.getAttribute("aria-label") === sel) || null;
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        if (!top) return null;
+        if (el.contains(top) || top.contains(el)) return null;
+        return `<${top.tagName.toLowerCase()}${top.className ? ` class="${String(top.className).slice(0, 80)}"` : ""}> "${(top.innerText || top.getAttribute("aria-label") || "").trim().slice(0, 60)}"`;
+      }, [selector, scope || null]);
+      if (diag) hint = `\nHint: ${diag} is intercepting this click. Try press_key(Escape) to dismiss dialogs, focus_element + keyboard, or click a different element first.`;
+    } catch {}
+    return textErr(`Error clicking: ${e.message}${hint}`);
+  }
 });
 
-server.tool("type", "Type text into an input field or text area on the current page. With delay=0 it fills the field instantly; with delay>0 it types character-by-character (useful to look human and trigger JS autocomplete). Can press Enter after typing.", {
+server.tool("type", "Type text into an input field or text area on the current page. With delay=0 it fills the field instantly; with delay>0 it types character-by-character (useful to look human and trigger JS autocomplete). Can press Enter after typing. Use scope to type into a field inside an open dialog or container.", {
   selector: z.string().describe("CSS selector of the input field or textarea (e.g. '#username', 'input[name=\"q\"]')"),
   text: z.string().describe("Text to type into the field"),
   press_enter: z.boolean().optional().default(false).describe("Press Enter after typing (e.g. to submit a search)"),
   delay: z.number().optional().default(0).describe("Delay between keystrokes in ms. 0 = instant fill. Use e.g. 50-100 for human-like typing"),
-}, async ({ selector, text: t, press_enter, delay }) => {
+  scope: z.string().optional().describe("CSS selector of a container to search within (e.g. '[role=dialog]' for the currently open dialog)"),
+}, async ({ selector, text: t, press_enter, delay, scope }) => {
   try {
     const page = requirePage();
-    if (delay > 0) await page.locator(selector).pressSequentially(t, { delay });
-    else await page.locator(selector).fill(t);
-    if (press_enter) await page.locator(selector).press("Enter");
+    const loc = scope ? page.locator(scope).first().locator(selector) : page.locator(selector);
+    if (delay > 0) await loc.pressSequentially(t, { delay });
+    else await loc.fill(t);
+    if (press_enter) await loc.press("Enter");
     await page.waitForTimeout(1000);
     return text(`Typed: ${t}`);
   } catch (e) { return textErr(`Error typing: ${e.message}`); }
+});
+
+server.tool("focus_element", "Move keyboard focus to an element by CSS selector or visible text. Many widgets only accept keyboard input once focused — e.g. GitHub tag/chip inputs, comboboxes, and custom dropdowns. After focusing, use press_key (e.g. Backspace/Delete to remove a chip, ArrowDown+Enter to pick a menu item). Use scope to focus inside an open dialog or container. If the element is not natively focusable (e.g. a plain <a> or <span>), this clicks it first to transfer focus.", {
+  selector: z.string().describe("CSS selector OR visible text when by_text=true"),
+  by_text: z.boolean().optional().default(false).describe("True: match by visible text content instead of CSS selector"),
+  scope: z.string().optional().describe("CSS selector of a container to search within (e.g. '[role=dialog]' for the currently open dialog)"),
+}, async ({ selector, by_text, scope }) => {
+  try {
+    const page = requirePage();
+    const scoped = scope ? page.locator(scope).first() : null;
+    let loc = by_text ? (scoped || page).getByText(selector).first() : (scoped || page).locator(selector).first();
+    const count = await loc.count();
+    if (!count) return textErr(`Element not found: ${selector}${scope ? ` inside "${scope}"` : ""}. Use list_elements or inspect_dom to find it.`);
+    await loc.scrollIntoViewIfNeeded().catch(() => {});
+    let focused = false;
+    try { await loc.focus(); focused = true; } catch {}
+    if (!focused) {
+      await loc.click({ force: true, timeout: 3000 }).catch(() => {});
+    }
+    await page.waitForTimeout(200);
+    const activeInfo = await page.evaluate(() => {
+      const el = document.activeElement;
+      return el ? `${el.tagName.toLowerCase()}: "${(el.innerText || el.getAttribute("aria-label") || el.getAttribute("value") || "").trim().slice(0, 60)}"` : "none";
+    });
+    const isTarget = await loc.evaluate((el) => el === document.activeElement || el.contains(document.activeElement) || document.activeElement?.contains(el)).catch(() => false);
+    return text(`Focused: ${selector}\nActive element: ${activeInfo}\nTarget has focus: ${isTarget ? "yes" : "no — target may need keyboard navigation (Tab/ArrowDown) or the widget manages focus internally"}`);
+  } catch (e) { return textErr(`Error focusing: ${e.message}`); }
+});
+
+server.tool("press_key", "Send keyboard keys to the focused element or the page. Use for shortcuts (Control+a), submitting forms (Enter), tabbing between fields (Tab), dismissing dialogs/modals (Escape), navigating menus (ArrowDown/ArrowUp + Enter), and removing tag/chip tokens (focus the chip with focus_element, then Backspace or Delete). Accepts comma-separated keys pressed in sequence, and repeats the whole sequence with times.", {
+  key: z.string().describe("Key or combo, e.g. 'Enter', 'Escape', 'Tab', 'Backspace', 'Delete', 'ArrowDown', 'ArrowUp', 'Control+a', 'F11'. Sequence example: 'Tab,Tab,Enter'"),
+  times: z.number().optional().default(1).describe("Repeat the full key sequence this many times (default 1)"),
+}, async ({ key, times }) => {
+  try {
+    const page = requirePage();
+    const keys = key.split(",").map(k => k.trim()).filter(Boolean);
+    if (!keys.length) return textErr("Provide at least one key to press");
+    for (let i = 0; i < times; i++) {
+      for (const k of keys) await page.keyboard.press(k);
+    }
+    await page.waitForTimeout(300);
+    return text(`Pressed: ${keys.join(", ")}${times > 1 ? ` x${times}` : ""}`);
+  } catch (e) { return textErr(`Error pressing key: ${e.message}`); }
 });
 
 server.tool("scroll", "Scroll the current page. Use down repeatedly to load content on infinite-scroll pages (social media, search results).", {
@@ -414,6 +519,136 @@ server.tool("get_page_content", "Extract readable text or raw HTML from the curr
       return text((await el.innerHTML()).substring(0, 10000));
     }
     return text((await el.innerText()).substring(0, 10000));
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("list_elements", "List the interactive elements (buttons, links, inputs, selects, menus, checkboxes) currently on the page, with their visible text and a CSS selector you can reuse. Use this to discover what is clickable/typeable instead of guessing selectors — essential on complex UIs like dialogs, modals, and dropdowns. Can filter by element kind or by text, and scope the search to a container (e.g. an open dialog) with scope.", {
+  kind: z.enum(["all", "button", "link", "input", "select", "textarea"]).optional().default("all").describe("Which kind of element to list (default: all interactive)"),
+  contains: z.string().optional().describe("Only show elements whose text, value, placeholder, or aria-label contains this string"),
+  scope: z.string().optional().describe("CSS selector of a container to limit the search to (e.g. '[role=dialog]' for the currently open dialog)"),
+  limit: z.number().optional().default(30).describe("Max number of elements to return (default 30)"),
+}, async ({ kind, contains, scope, limit }) => {
+  try {
+    const page = requirePage();
+    const result = await page.evaluate(({ kind, contains, scope, limit }) => {
+      const map = {
+        button: "button, [role='button'], input[type='button'], input[type='submit']",
+        link: "a[href]",
+        input: "input, textarea, select",
+        select: "select",
+        textarea: "textarea",
+        all: "button, a[href], input, textarea, select, [role='button'], [role='checkbox'], [role='radio'], [role='tab'], [role='menuitem'], [role='switch'], [role='link']",
+      };
+      let root = document;
+      if (scope) {
+        try { root = document.querySelector(scope) || document; } catch {}
+      }
+      const els = [...root.querySelectorAll(map[kind] || map.all)];
+      const out = [];
+      const seen = new Set();
+      for (const el of els) {
+        const label = (el.innerText || el.value || el.placeholder || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim().slice(0, 80);
+        if (contains) {
+          const hay = (label + " " + (el.textContent || "")).toLowerCase();
+          if (!hay.includes(contains.toLowerCase())) continue;
+        }
+        if (out.length >= limit) break;
+        const parts = [];
+        let n = el;
+        while (n && n.nodeType === 1 && n !== root && parts.length < 5) {
+          let s = n.tagName.toLowerCase();
+          if (n.id) s += `#${n.id}`;
+          const parent = n.parentElement;
+          if (parent) {
+            const siblings = [...parent.children].filter(c => c.tagName === n.tagName);
+            if (siblings.length > 1) s += `:nth-of-type(${siblings.indexOf(n) + 1})`;
+          }
+          parts.unshift(s);
+          n = parent;
+        }
+        const sel = parts.join(" > ");
+        if (seen.has(sel)) continue;
+        seen.add(sel);
+        out.push({
+          kind: el.tagName.toLowerCase() + (el.getAttribute("type") ? `[type="${el.getAttribute("type")}"]` : ""),
+          text: label,
+          visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),
+          disabled: el.disabled === true || el.getAttribute("aria-disabled") === "true",
+          selector: sel,
+          in_scope: root !== document,
+        });
+      }
+      return out;
+    }, { kind, contains, scope, limit });
+    if (!result.length) return text(`No matching elements found${scope ? ` inside "${scope}"` : ""}. Try list_elements(kind="all") to see everything, or use inspect_dom to explore the page structure.`);
+    const lines = result.map((e, i) => `${i}: <${e.kind}>${e.disabled ? " [disabled]" : ""}${e.visible ? "" : " [hidden]"} "${e.text}" -> ${e.selector}`).join("\n");
+    return text(`Interactive elements (${result.length})${scope ? ` in ${scope}` : ""}:\n${lines}`);
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("inspect_dom", "Inspect an element's structure and attributes to understand how a complex UI is built (dialogs, dropdowns, token chips, menus, custom widgets). Given a CSS selector or visible text, returns the element's tag, attributes, class names, a reusable CSS path, and its child elements up to max_depth. Use this BEFORE interacting when you are unsure how an element works or when clicks fail. Use scope to inspect elements inside an open dialog or container.", {
+  selector: z.string().describe("CSS selector OR exact visible text when by_text=true"),
+  by_text: z.boolean().optional().default(false).describe("True: match by exact visible text content instead of CSS selector"),
+  scope: z.string().optional().describe("CSS selector of a container to limit the search to (e.g. '[role=dialog]' for the currently open dialog)"),
+  max_depth: z.number().optional().default(2).describe("How many levels of child elements to include (default 2)"),
+  include_html: z.boolean().optional().default(false).describe("Also return the element's raw outerHTML (first 2000 chars)"),
+}, async ({ selector, by_text, scope, max_depth, include_html }) => {
+  try {
+    const page = requirePage();
+    const result = await page.evaluate(({ selector, by_text, scope, max_depth, include_html }) => {
+      function pathOf(el, root) {
+        const parts = [];
+        let n = el;
+        while (n && n.nodeType === 1 && n !== root && parts.length < 5) {
+          let s = n.tagName.toLowerCase();
+          if (n.id) s += `#${n.id}`;
+          const parent = n.parentElement;
+          if (parent) {
+            const siblings = [...parent.children].filter(c => c.tagName === n.tagName);
+            if (siblings.length > 1) s += `:nth-of-type(${siblings.indexOf(n) + 1})`;
+          }
+          parts.unshift(s);
+          n = parent;
+        }
+        return parts.join(" > ");
+      }
+      function describe(el, depth, root) {
+        if (!el || el.nodeType !== 1 || depth > max_depth) return null;
+        const attrs = {};
+        for (const a of el.attributes) {
+          const name = a.name.toLowerCase();
+          if (["id", "class", "role", "aria-label", "aria-checked", "aria-expanded", "aria-selected", "aria-current", "aria-disabled", "placeholder", "name", "type", "value", "href", "title", "data-testid", "tabindex"].includes(name)) attrs[name] = a.value;
+        }
+        const node = { tag: el.tagName.toLowerCase(), attrs, text: (el.innerText || "").trim().slice(0, 80), selector: pathOf(el, root) };
+        if (include_html && depth === 0) node.html = el.outerHTML.slice(0, 2000);
+        if (el.children.length && depth < max_depth) {
+          node.children = [...el.children].slice(0, 15).map(c => describe(c, depth + 1, root)).filter(Boolean);
+        }
+        return node;
+      }
+      let root = document;
+      if (scope) {
+        try { root = document.querySelector(scope) || document; } catch {}
+      }
+      let els = [];
+      if (by_text) {
+        const target = selector.trim();
+        const matches = (el) => {
+          const t = (el.textContent || "").trim();
+          return t === target || t.startsWith(target + "\n") || t.startsWith(target + " (") || t.startsWith(target + " (") || t.startsWith(target + " (");
+        };
+        const all = [...root.querySelectorAll("*")].filter(matches);
+        if (all.length) {
+          const focusable = all.filter(el => el.hasAttribute("tabindex") || el.getAttribute("role") || el.tagName === "BUTTON" || el.tagName === "A");
+          els = (focusable.length ? focusable : all).slice(0, 5);
+        }
+      } else {
+        try { els = [...root.querySelectorAll(selector)].slice(0, 5); } catch {}
+      }
+      if (!els.length) return { found: false, hint: by_text ? `No element with that exact text${scope ? ` inside "${scope}"` : ""}. Use list_elements or get_page_content to find the right text.` : `No element matches that selector${scope ? ` inside "${scope}"` : ""}. Try list_elements to discover what is on the page.` };
+      return { found: true, scope: scope || "document", count: els.length, elements: els.map(el => describe(el, 0, root)) };
+    }, { selector, by_text, scope, max_depth, include_html });
+    return text(JSON.stringify(result, null, 2));
   } catch (e) { return textErr(`Error: ${e.message}`); }
 });
 

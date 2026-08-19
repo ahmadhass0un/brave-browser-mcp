@@ -95,8 +95,19 @@ async function run() {
   // === NAVIGATE HISTORY ===
   console.log("\n=== NAVIGATE HISTORY ===");
   try {
+    const t = parseResult(await callTool("tabs", { action: "open" }));
+    ok("open fresh tab for history test", !t.isError);
+    await callTool("navigate", { url: "https://example.com" });
+    await callTool("navigate", { url: "https://example.org" });
     const r = parseResult(await callTool("navigate_history", { action: "back" }));
-    ok("go back", !r.isError && r.text.includes("Back"));
+    ok("go back to example.com", !r.isError && r.text.includes("example.com"));
+    const list = parseResult(await callTool("tabs", { action: "list" }));
+    const lines = list.text.split("\n");
+    const idxLine = lines.find(l => l.includes("example.org"));
+    if (idxLine) {
+      const idx = parseInt(idxLine.trim().split(":")[0], 10);
+      if (!isNaN(idx)) await callTool("tabs", { action: "close", index: idx });
+    }
   } catch (e) { err("navigate_history", e); }
 
   // === CLICK ===
@@ -148,6 +159,55 @@ async function run() {
     const r2 = parseResult(await callTool("get_page_content", { selector: "body", format: "html" }));
     ok("get html content", !r2.isError && r2.text.includes("<"));
   } catch (e) { err("get_page_content", e); }
+
+  // === LIST ELEMENTS ===
+  console.log("\n=== LIST ELEMENTS ===");
+  try {
+    await callTool("navigate", { url: "https://example.com" });
+    await new Promise(r => setTimeout(r, 1000));
+    const r = parseResult(await callTool("list_elements", { kind: "link" }));
+    ok("list_elements finds links", !r.isError && r.text.includes("Learn more"));
+
+    const r2 = parseResult(await callTool("list_elements", { kind: "button" }));
+    ok("list_elements buttons (may be empty)", !r2.isError);
+
+    const r3 = parseResult(await callTool("list_elements", { kind: "link", contains: "Learn", limit: 3 }));
+    ok("list_elements filter by contains", !r3.isError && r3.text.includes("Learn more"));
+  } catch (e) { err("list_elements", e); }
+
+  // === INSPECT DOM ===
+  console.log("\n=== INSPECT DOM ===");
+  try {
+    const r = parseResult(await callTool("inspect_dom", { selector: "body", max_depth: 1 }));
+    ok("inspect_dom body structure", !r.isError && r.json?.elements?.length > 0);
+
+    const r2 = parseResult(await callTool("inspect_dom", { selector: "Example Domain", by_text: true }));
+    ok("inspect_dom by text", !r2.isError && r2.json?.found === true);
+
+    const r3 = parseResult(await callTool("inspect_dom", { selector: "nonexistent-xyz-123", by_text: true }));
+    ok("inspect_dom not found reports hint", !r3.isError && r3.json?.found === false);
+  } catch (e) { err("inspect_dom", e); }
+
+  // === FOCUS ELEMENT ===
+  console.log("\n=== FOCUS ELEMENT ===");
+  try {
+    await callTool("navigate", { url: "https://www.google.com" });
+    await new Promise(r => setTimeout(r, 3000));
+    const r = parseResult(await callTool("focus_element", { selector: "textarea[name='q'], input[name='q']" }));
+    ok("focus_element on search box", !r.isError && r.text.includes("Focused"));
+  } catch (e) { err("focus_element", e); }
+
+  // === PRESS KEY ===
+  console.log("\n=== PRESS KEY ===");
+  try {
+    await callTool("navigate", { url: "https://example.com" });
+    await new Promise(r => setTimeout(r, 1000));
+    const r = parseResult(await callTool("press_key", { key: "Escape" }));
+    ok("press_key Escape", !r.isError && r.text.includes("Pressed"));
+
+    const r2 = parseResult(await callTool("press_key", { key: "Control+a" }));
+    ok("press_key combo", !r2.isError && r2.text.includes("Pressed"));
+  } catch (e) { err("press_key", e); }
 
   // === SCREENSHOT ===
   console.log("\n=== SCREENSHOT ===");
