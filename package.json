@@ -1,0 +1,16 @@
+{
+  "name": "browser-navigator-mcp",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MCP server for Brave browser automation with CAPTCHA detection, OSINT tools, and window/tab management",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "playwright": "^1.40.0",
+    "ws": "^8.21.3",
+    "zod": "^3.22.0"
+  }
+}
