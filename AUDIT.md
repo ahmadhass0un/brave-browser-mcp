@@ -53,5 +53,8 @@
 | 32 | `launch-brave.sh` launches private instance | ✅ Removed private instance (port 9223) |
 | 33 | `PROFILES_DIR` never used | ✅ Removed |
 | 34 | Tests bypass MCP | ⚠️ Not changed (future work) |
-| 35 | Missing test cases | ⚠️ Not changed (future work) |
+| 35 | Missing test cases | ✅ Added 63 assertions covering all tools incl. `list_elements`, `inspect_dom`, `focus_element`, `press_key` |
 | 36 | Version hardcoded | ✅ Reads from `package.json` |
+| 37 | LLM blind to complex UIs (dialogs, token chips) | ✅ Added `list_elements` (interactive elements + reusable selectors), `inspect_dom` (structure/attrs/children), `focus_element` (focus via selector or text, honest focus-state report), `press_key` (keys/combos/sequences); added `scope` param to `click`, `type`, `list_elements`, `inspect_dom`, `focus_element` |
+| 38 | `click` silently succeeded on missing selectors | ✅ Now errors with guidance; JS-click fallback only when overlay intercepts real click; `by_text` also matches `aria-label` |
+| 39 | `navigate_history` hung ~45s on bfcache pages | ✅ Uses `history.back()/forward()` + URL-poll + settle; ~1.3s |
