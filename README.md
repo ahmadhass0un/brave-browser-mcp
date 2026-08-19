@@ -134,4 +134,8 @@ node test.cjs
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**PolyForm Noncommercial 1.0.0** — see [LICENSE](LICENSE).
+
+Free to use for any **noncommercial** purpose (personal, research, education,
+hobby, charities, government). For **commercial use**, contact the author
+first — please reach out before using this project commercially.
