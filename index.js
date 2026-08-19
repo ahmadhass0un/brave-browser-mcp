@@ -70,6 +70,20 @@ function safePath(dir, filename) {
   return target;
 }
 
+async function applyNativeColorScheme(page) {
+  try {
+    const session = await page.context().newCDPSession(page);
+    await session.send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "" }] });
+    await session.detach().catch(() => {});
+  } catch (e) { log(`applyNativeColorScheme: ${e.message}`); }
+}
+
+async function applyNativeColorSchemeAll() {
+  for (const ctx of contexts) {
+    for (const page of ctx.pages()) await applyNativeColorScheme(page);
+  }
+}
+
 async function waitForPageReady(page, timeout = 30000) {
   try {
     await page.waitForLoadState("domcontentloaded", { timeout });
@@ -234,6 +248,7 @@ async function finalizeConnection() {
   }
   currentContextIndex = 0;
   currentPage = contexts[0].pages()[0] || await contexts[0].newPage();
+  await applyNativeColorSchemeAll();
 }
 
 async function connectToBrave() {
@@ -259,7 +274,7 @@ async function connectToBrave() {
     return { ok: false, message: "Brave is running but without debug port enabled. Tell the user to close Brave manually, then call connect_brave again." };
   }
 
-  spawn(getBravePath(), [`--remote-debugging-port=${BROWSER_PORT}`], { detached: true, stdio: "ignore" }).unref();
+  spawn(getBravePath(), [`--remote-debugging-port=${BROWSER_PORT}`, "--force-dark-mode"], { detached: true, stdio: "ignore" }).unref();
 
   for (let i = 0; i < 15; i++) {
     await new Promise(r => setTimeout(r, 1000));
@@ -717,6 +732,7 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
       if (action === "open") {
         const page = await ctx.newPage();
         if (url) { await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }); await waitForPageReady(page); }
+        await applyNativeColorScheme(page);
         currentPage = page;
         let result = `New tab opened${url ? `: ${url}` : ""}\nTitle: ${await page.title()}`;
         const captchaResult = await autoWaitForCaptcha();
@@ -821,6 +837,7 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
         currentContextIndex = index;
         const pages = contexts[index].pages();
         currentPage = pages.length > 0 ? pages[0] : await contexts[index].newPage();
+        await applyNativeColorScheme(currentPage);
         await currentPage.bringToFront();
         return text(`Switched to window ${index}: ${currentPage.url()}`);
       }
