@@ -971,9 +971,10 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
       }
 
       if (action === "switch") {
-        if (lastWindowsList.length === 0) return textErr("Run windows list first to see window indexes.");
-        if (index === undefined || index < 0 || index >= lastWindowsList.length) return textErr(`Invalid index. Available: 0-${lastWindowsList.length - 1}`);
-        const win = lastWindowsList[index];
+        if (allWindows.length === 0) return textErr("No windows detected. Run connect_brave first.");
+        if (index === undefined || index < 0 || index >= allWindows.length) return textErr(`Invalid index. Available: 0-${allWindows.length - 1}`);
+        lastWindowsList = allWindows.slice();
+        const win = allWindows[index];
         let switched = false;
         for (const tab of win.tabs) {
           const hit = await pageByTargetId(tab.id);
@@ -1003,10 +1004,11 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
       }
 
       if (action === "close") {
-        if (lastWindowsList.length === 0) return textErr("Run windows list first to see window indexes.");
-        if (index === undefined || index < 0 || index >= lastWindowsList.length) return textErr(`Invalid index. Available: 0-${lastWindowsList.length - 1}`);
-        if (lastWindowsList.length <= 1) return textErr("Cannot close the last window");
-        const win = lastWindowsList[index];
+        if (allWindows.length === 0) return textErr("No windows detected. Run connect_brave first.");
+        if (index === undefined || index < 0 || index >= allWindows.length) return textErr(`Invalid index. Available: 0-${allWindows.length - 1}`);
+        if (allWindows.length <= 1) return textErr("Cannot close the last window");
+        lastWindowsList = allWindows.slice();
+        const win = allWindows[index];
         const closedPages = [];
         for (const tab of win.tabs) {
           const hit = await pageByTargetId(tab.id);
