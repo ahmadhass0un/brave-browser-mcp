@@ -9,8 +9,9 @@ import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
-import WebSocket from "ws";
 import { readFileSync as readPkg } from "fs";
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
+import os from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const COOKIES_DIR = join(__dirname, "../../cookies");
@@ -73,6 +74,150 @@ function safePath(dir, filename) {
   return target;
 }
 
+const ALLOWED_URL_SCHEMES = new Set(["http:", "https:", "about:", "blob:"]);
+
+function safeNavigateUrl(url, { allowFile = false } = {}) {
+  if (typeof url !== "string") throw new Error(`Blocked navigation: expected a string URL, got ${typeof url}`);
+  const trimmed = url.trim();
+  if (trimmed === "about:blank" || trimmed === "about:blank#") return trimmed;
+  const colon = trimmed.indexOf(":");
+  if (colon <= 0) throw new Error(`Blocked navigation: "${url}" is not an absolute URL. Include a scheme, e.g. https://example.com.`);
+  const scheme = trimmed.slice(0, colon + 1).toLowerCase();
+  if (ALLOWED_URL_SCHEMES.has(scheme)) return trimmed;
+  if (scheme === "file:" && allowFile) return trimmed;
+  const allowed = allowFile ? "http, https, about, blob, file" : "http, https, about, blob";
+  throw new Error(`Blocked navigation: "${url}" uses the disallowed "${scheme}" scheme. Allowed schemes: ${allowed}.`);
+}
+
+const BLOCKED_HOSTS = new Set([
+  "localhost", "localhost.localdomain", "localhost4", "localhost6",
+  "0.0.0.0", "::", "::1", "169.254.169.254", "100.100.100.200",
+  "metadata", "metadata.google.internal", "instance-data", "instance-data.ec2.internal",
+]);
+
+const BLOCKED_CIDRS = [
+  [0x00000000, 8],
+  [0x0a000000, 8],
+  [0x64400000, 10],
+  [0x64646400, 24],
+  [0x7f000000, 8],
+  [0xa9fe0000, 16],
+  [0xac100000, 12],
+  [0xc0a80000, 16],
+];
+
+function ipv4ToInt(ip) {
+  const parts = String(ip).split(".");
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return null;
+    const v = parseInt(p, 10);
+    if (v > 255) return null;
+    n = (n << 8) | v;
+  }
+  return n >>> 0;
+}
+
+function inBlockedCidrs(ip) {
+  for (const [base, bits] of BLOCKED_CIDRS) {
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    if ((ip & mask) === (base & mask)) return true;
+  }
+  return false;
+}
+
+function isBlockedInternalUrl(url) {
+  let u;
+  try { u = new URL(String(url)); } catch { return false; }
+  if (!["http:", "https:", "ws:", "wss:"].includes(u.protocol)) return false;
+  let host = u.hostname.toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (BLOCKED_HOSTS.has(host)) return true;
+  if (host.startsWith("fe80:")) return true;
+  if (/^f[cd][0-9a-f]{2}:/i.test(host)) return true;
+  if (/^\d{1,10}$/.test(host)) {
+    const n = parseInt(host, 10);
+    if (Number.isSafeInteger(n) && inBlockedCidrs(ipv4ToInt([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join(".")))) return true;
+  }
+  const ip = ipv4ToInt(host);
+  return ip !== null && inBlockedCidrs(ip);
+}
+
+function assertSafeUrl(url) {
+  if (isBlockedInternalUrl(url)) {
+    throw new Error(`Blocked: ${url} points to an internal/loopback address (SSRF guard).`);
+  }
+  return url;
+}
+
+function extractVisibleText({ region = "", limit = 10000, fallbackToBody = true } = {}) {
+  const root = region
+    ? (document.querySelector(region) || (fallbackToBody ? document.body : null))
+    : document.body;
+  if (!root) return "";
+  const SKIP = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "HEAD", "IFRAME", "SVG", "TEXTAREA", "SELECT", "INPUT", "OPTION"]);
+  const BLOCK = new Set(["P", "DIV", "SECTION", "ARTICLE", "LI", "UL", "OL", "H1", "H2", "H3", "H4", "H5", "H6", "TR", "TH", "TD", "BR", "HR", "HEADER", "FOOTER", "ASIDE", "NAV", "MAIN", "BLOCKQUOTE", "PRE", "TABLE", "FIGCAPTION", "SUMMARY", "DL", "DT", "DD"]);
+  const parts = [];
+  let budget = limit;
+  let visited = 0;
+  const emit = (s) => { if (budget > 0 && s) { parts.push(s); budget -= s.length; } };
+  const emitText = (s) => {
+    if (budget <= 0) return;
+    const t = s.replace(/\s+/g, " ");
+    if (t) { parts.push(t); budget -= t.length; }
+  };
+  const walk = (node) => {
+    if (budget <= 0 || ++visited > 50000) return;
+    if (node.nodeType === Node.TEXT_NODE) { emitText(node.data); return; }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const tag = node.tagName;
+    if (SKIP.has(tag)) return;
+    if (node.hidden || node.getAttribute("aria-hidden") === "true") return;
+    const cs = getComputedStyle(node);
+    if (cs.display === "none" || cs.visibility === "hidden") return;
+    if (tag === "BR") { emit("\n"); return; }
+    const isBlock = BLOCK.has(tag);
+    if (isBlock && parts.length) emit("\n");
+    for (let c = node.firstChild; c; c = c.nextSibling) walk(c);
+    if (isBlock && parts.length) emit("\n");
+  };
+  walk(root);
+  return parts.join("").replace(/\n{3,}/g, "\n\n").trim().slice(0, limit);
+}
+
+const KEY_PASSPHRASE = `${os.homedir()}::browser-navigator-mcp`;
+
+function encryptCookies(obj) {
+  const salt = randomBytes(16);
+  const key = scryptSync(KEY_PASSPHRASE, salt, 32);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const data = Buffer.concat([cipher.update(JSON.stringify(obj), "utf-8"), cipher.final()]);
+  return JSON.stringify({
+    v: 1, alg: "aes-256-gcm", kdf: "scrypt",
+    salt: salt.toString("hex"), iv: iv.toString("hex"),
+    tag: cipher.getAuthTag().toString("hex"), data: data.toString("hex"),
+  });
+}
+
+function decryptCookies(str) {
+  let parsed;
+  try { parsed = JSON.parse(str); } catch { return null; }
+  if (parsed && typeof parsed === "object" && parsed.v === 1 && parsed.alg === "aes-256-gcm") {
+    try {
+      const key = scryptSync(KEY_PASSPHRASE, Buffer.from(parsed.salt, "hex"), 32);
+      const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(parsed.iv, "hex"));
+      decipher.setAuthTag(Buffer.from(parsed.tag, "hex"));
+      const pt = Buffer.concat([decipher.update(Buffer.from(parsed.data, "hex")), decipher.final()]);
+      return JSON.parse(pt.toString("utf-8"));
+    } catch (e) {
+      log(`decryptCookies: profile undecodable (different user/machine or corrupt): ${e.message}`);
+      return null;
+    }
+  }
+  return parsed;
+}
+
 async function applyNativeColorScheme(page) {
   const session = await page.context().newCDPSession(page).catch(() => null);
   if (!session) return;
@@ -88,7 +233,65 @@ async function applyNativeColorSchemeAll() {
   await Promise.allSettled(pages.map(p => applyNativeColorScheme(p)));
 }
 
+let targetsCache = null;
+function invalidateTargetsCache() { targetsCache = null; }
+
+async function getTargetsBatched() {
+  if (!cdpSession) return null;
+  if (targetsCache) return targetsCache;
+  const { targetInfos } = await cdpSession.send("Target.getTargets");
+  const map = new Map();
+  const byWindow = new Map();
+  for (const t of targetInfos) {
+    if (t.type !== "page") continue;
+    map.set(t.targetId, {
+      targetId: t.targetId,
+      url: t.url,
+      title: t.title,
+      browserContextId: t.browserContextId,
+      windowId: null,
+    });
+    if (typeof t.windowId === "number") map.get(t.targetId).windowId = t.windowId;
+  }
+  for (const info of map.values()) {
+    if (info.windowId) continue;
+    const key = info.browserContextId ?? info.targetId;
+    if (!byWindow.has(key)) byWindow.set(key, []);
+    byWindow.get(key).push(info);
+  }
+  await Promise.allSettled([...byWindow.values()].map(async (group) => {
+    for (const rep of group) {
+      try {
+        const { windowId } = await cdpSession.send("Browser.getWindowForTarget", { targetId: rep.targetId });
+        if (windowId) { for (const i of group) i.windowId = windowId; break; }
+      } catch {}
+    }
+  }));
+  targetsCache = map;
+  return map;
+}
+
+function targetInfoForPage(page, targets) {
+  if (!targets || !page) return null;
+  const url = page.url();
+  let hit = null;
+  for (const info of targets.values()) {
+    if (info.url === url) {
+      if (hit) return null;
+      hit = info;
+    }
+  }
+  return hit;
+}
+
 async function pageWindowInfo(page) {
+  try {
+    const targets = await getTargetsBatched();
+    if (targets) {
+      const info = targetInfoForPage(page, targets);
+      if (info) return { targetId: info.targetId, windowId: info.windowId };
+    }
+  } catch {}
   try {
     const s = await page.context().newCDPSession(page);
     try {
@@ -103,10 +306,8 @@ async function waitForPageReady(page, timeout = 30000, waitUntil = "domcontentlo
   try {
     if (waitUntil === "commit") return;
     await page.waitForLoadState("domcontentloaded", { timeout });
-    if (waitUntil !== "load" && waitUntil !== "networkidle") {
-      await page.waitForFunction(() => document.readyState === "complete", { timeout: Math.min(3000, timeout) }).catch(() => {});
-    } else {
-      await page.waitForFunction(() => document.readyState === "complete", { timeout });
+    if (waitUntil === "load" || waitUntil === "networkidle") {
+      await page.waitForFunction(() => document.readyState === "complete", { timeout }).catch(() => {});
     }
   } catch (e) {
     log(`waitForPageReady: ${e.message}`);
@@ -123,7 +324,11 @@ function loadCookies(profileName) {
   const safe = sanitizeProfile(profileName);
   const p = safePath(COOKIES_DIR, `${safe}.json`);
   if (existsSync(p)) {
-    try { return JSON.parse(readFileSync(p, "utf-8")); } catch (e) { log(`loadCookies parse error: ${e.message}`); }
+    try {
+      const cookies = decryptCookies(readFileSync(p, "utf-8"));
+      if (cookies) return cookies;
+      log(`loadCookies: profile "${safe}" could not be decoded; ignoring.`);
+    } catch (e) { log(`loadCookies parse error: ${e.message}`); }
   }
   return null;
 }
@@ -131,11 +336,19 @@ function loadCookies(profileName) {
 function saveCookiesFn(profileName, cookies) {
   const safe = sanitizeProfile(profileName);
   const p = safePath(COOKIES_DIR, `${safe}.json`);
-  writeFileSync(p, JSON.stringify(cookies, null, 2), { mode: 0o600 });
+  writeFileSync(p, encryptCookies(cookies), { mode: 0o600 });
 }
 
 function findContextById(ctxId) {
   return contexts.find((c) => getCtxId(c) === ctxId) || null;
+}
+
+function pruneContextMeta() {
+  if (!browser) return;
+  const liveIds = new Set(browser.contexts().map((c) => getCtxId(c)).filter(Boolean));
+  for (const id of contextMeta.keys()) {
+    if (!liveIds.has(id)) contextMeta.delete(id);
+  }
 }
 
 function syncContexts() {
@@ -151,6 +364,7 @@ function syncContexts() {
       contexts.push(ctx);
     }
   }
+  pruneContextMeta();
   if (currentContextIndex >= contexts.length) currentContextIndex = Math.max(0, contexts.length - 1);
   const ctx = getContext();
   if (ctx) {
@@ -160,6 +374,20 @@ function syncContexts() {
   } else {
     currentPage = null;
   }
+}
+
+function recoverCurrentPage() {
+  syncContexts();
+  const current = getContext();
+  if (current && current.pages().length > 0) return currentPage;
+  for (let i = 0; i < contexts.length; i++) {
+    const pages = contexts[i].pages();
+    if (pages.length > 0) {
+      currentContextIndex = i;
+      return (currentPage = pages[0]);
+    }
+  }
+  return (currentPage = null);
 }
 
 async function detectCaptcha() {
@@ -228,7 +456,7 @@ async function detectCaptcha() {
   }
 }
 
-async function waitForCaptchaSolved(timeoutMs = 120000) {
+async function waitForCaptchaSolved(timeoutMs = 30000) {
   if (!currentPage) return { solved: false, seconds: 0 };
   const startTime = Date.now();
   const solved = await currentPage.evaluate((timeout) => {
@@ -275,7 +503,7 @@ async function waitForCaptchaSolved(timeoutMs = 120000) {
 async function autoWaitForCaptcha() {
   const info = await detectCaptcha();
   if (!info?.found || info.solved) return info?.found ? `${info.type} [SOLVED]` : null;
-  const result = await waitForCaptchaSolved(120000);
+  const result = await waitForCaptchaSolved(30000);
   if (!result.solved) return `${info.type} [TIMEOUT]`;
   return `${info.type} solved in ${result.seconds}s`;
 }
@@ -293,6 +521,7 @@ function cleanup() {
   currentContextIndex = 0;
   currentPage = null;
   contextMeta.clear();
+  targetsCache = null;
 }
 
 process.on("SIGINT", () => { cleanup(); process.exit(0); });
@@ -325,6 +554,8 @@ async function finalizeConnection() {
     if (!getCtxId(ctx)) contextIdMap.set(ctx, id);
     if (!contextMeta.has(id)) contextMeta.set(id, { isIncognito: false });
   }
+  pruneContextMeta();
+  invalidateTargetsCache();
   currentContextIndex = 0;
   if (contexts.length === 0) { currentPage = null; return; }
   currentPage = contexts[0].pages()[0] || await contexts[0].newPage();
@@ -368,7 +599,7 @@ async function connectToBrave() {
   if (!existsSync(bravePath)) {
     return { ok: false, message: "Brave browser not found. Install Brave or start it manually." };
   }
-  const child = spawn(bravePath, [`--remote-debugging-port=${BROWSER_PORT}`, "--force-dark-mode"], { detached: true, stdio: "ignore" });
+  const child = spawn(bravePath, [`--remote-debugging-port=${BROWSER_PORT}`, "--remote-debugging-address=127.0.0.1", "--remote-allow-origins=http://127.0.0.1,http://localhost", "--force-dark-mode"], { detached: true, stdio: "ignore" });
   child.on("error", (err) => log(`Failed to launch Brave: ${err.message}`));
   child.unref();
 
@@ -402,11 +633,9 @@ server.tool("connect_brave", "Connect to Brave browser. Attaches to existing tab
     let out = `Connected to Brave\nOpen tabs: ${tabCount}`;
     if (cdpSession) {
       try {
-        const { targetInfos } = await cdpSession.send("Target.getTargets");
+        const targets = await getTargetsBatched();
         const winIds = new Set();
-        for (const t of targetInfos.filter(x => x.type === "page")) {
-          try { const { windowId } = await cdpSession.send("Browser.getWindowForTarget", { targetId: t.targetId }); winIds.add(windowId); } catch {}
-        }
+        if (targets) for (const t of targets.values()) if (t.windowId) winIds.add(t.windowId);
         out += `\nWindows: ${winIds.size}`;
         if (winIds.size > 1) out += `\nMultiple windows detected. Use 'windows list' to see them and 'windows switch' to change windows.`;
       } catch { out += `\nWindows: ${contexts.length}`; }
@@ -434,9 +663,13 @@ server.tool("navigate", "Navigate the current tab to a URL. Waits for the page t
 }, async ({ url, wait_until, timeout }) => {
   try {
     const page = requirePage();
-    await page.goto(url, { waitUntil: wait_until, timeout });
-    await waitForPageReady(page, timeout, wait_until);
-    let result = `Navigated to: ${url}\nTitle: ${await page.title()}`;
+    assertSafeUrl(url);
+    const safeUrl = safeNavigateUrl(url);
+    await page.goto(safeUrl, { waitUntil: wait_until, timeout });
+    if (wait_until === "load" || wait_until === "networkidle") {
+      await waitForPageReady(page, timeout, wait_until);
+    }
+    let result = `Navigated to: ${safeUrl}\nTitle: ${await page.title()}`;
     const captchaResult = await autoWaitForCaptcha();
     if (captchaResult) result += `\nCAPTCHA: ${captchaResult}`;
     return text(result);
@@ -461,6 +694,7 @@ server.tool("navigate_history", "Go back or forward in the current tab's history
     if (!changed) {
       const after = await page.evaluate(() => history.length);
       if (action === "forward" && after === histLen) return text(`No history entry to go forward. Already at the last page in history (URL unchanged: ${beforeUrl}).`);
+      if (action === "back" && after === histLen) return text(`No history entry to go back. Already at the beginning of history (URL unchanged: ${beforeUrl}).`);
     }
     await waitForPageReady(page, 5000, "domcontentloaded");
     let result = `${target} to: ${page.url()}`;
@@ -480,8 +714,9 @@ server.tool("click", "Click an element on the current page. By default uses a CS
   const page = requirePage();
   const scoped = scope ? page.locator(scope).first() : null;
   try {
-    await waitForPageReady(page);
+    await waitForPageReady(page, 5000, "load");
     let clicked = false;
+    let jsClicked = false;
     let found = false;
     if (by_text) {
       const loc = (scoped || page).getByText(selector, { exact: true }).first();
@@ -497,7 +732,7 @@ server.tool("click", "Click an element on the current page. By default uses a CS
           clicked = true;
         } catch {
           const ok = await el.evaluate((n) => { n.click(); return n.isConnected; }).catch(() => false);
-          if (ok) clicked = true;
+          if (ok) jsClicked = true;
         }
       }
     } else {
@@ -510,10 +745,10 @@ server.tool("click", "Click an element on the current page. By default uses a CS
           clicked = true;
         } catch {
           const ok = await el.evaluate((n) => { n.click(); return n.isConnected; }).catch(() => false);
-          if (ok) clicked = true;
+          if (ok) jsClicked = true;
         }
       }
-      if (!clicked) {
+      if (!clicked && !jsClicked) {
         const didJs = await page.evaluate(([sel, scp]) => {
           const root = scp ? document.querySelector(scp) : document;
           if (!root) return false;
@@ -521,14 +756,17 @@ server.tool("click", "Click an element on the current page. By default uses a CS
           if (el) { el.click(); return true; }
           return false;
         }, [selector, scope || null]);
-        if (didJs) clicked = true;
+        if (didJs) jsClicked = true;
       }
     }
-    if (!found && !clicked) {
+    if (!found) {
       return textErr(`Element not found: ${selector}${scope ? ` inside "${scope}"` : ""}. Use list_elements to see what's on the page, or inspect_dom to explore the structure.`);
     }
-    await waitForPageReady(page);
+    if (!clicked && !jsClicked) {
+      return textErr(`Element found but click failed: ${selector}${scope ? ` inside "${scope}"` : ""}. Real mouse click was blocked or no-op, and the JS click() fallback also failed.`);
+    }
     let result = `Clicked: ${selector}`;
+    if (jsClicked && !clicked) result += " (via JS click fallback)";
     const captchaResult = await autoWaitForCaptcha();
     if (captchaResult) result += `\nCAPTCHA: ${captchaResult}`;
     return text(result);
@@ -657,7 +895,12 @@ server.tool("get_page_content", "Extract readable text or raw HTML from the curr
     if (format === "html") {
       return text(await el.evaluate((n) => (n?.innerHTML || "").slice(0, 10000)));
     }
-    return text(await el.evaluate((n) => (n?.innerText || "").slice(0, 10000)));
+    const region = selector === "body" ? 'main, article, #content, [role="main"]' : selector;
+    return text(await page.evaluate(extractVisibleText, {
+      region,
+      limit: 10000,
+      fallbackToBody: selector === "body",
+    }));
   } catch (e) { return textErr(`Error: ${e.message}`); }
 });
 
@@ -774,7 +1017,7 @@ server.tool("inspect_dom", "Inspect an element's structure and attributes to und
         const target = selector.trim();
         const matches = (el) => {
           const t = (el.textContent || "").trim();
-          return t === target || t.startsWith(target + "\n") || t.startsWith(target + " (") || t.startsWith(target + " (") || t.startsWith(target + " (");
+          return t === target || t.startsWith(target + "\n") || t.startsWith(target + " (");
         };
         const all = [...root.querySelectorAll("*")].filter(matches);
         if (all.length) {
@@ -809,16 +1052,58 @@ server.tool("screenshot", "Capture a PNG screenshot of the current page (full pa
   } catch (e) { return textErr(`Error: ${e.message}`); }
 });
 
-server.tool("execute_js", "Run arbitrary JavaScript in the current page and return the last expression's value. DANGER: can read cookies, localStorage, and make network requests — set confirm=true to acknowledge. Output is truncated at 50000 chars. Prefer other tools (get_page_content, screenshot) when they suffice.", {
+server.tool("execute_js", "Run arbitrary JavaScript in the current page and return the last expression's value. DANGER: set confirm=true to acknowledge. Credential-bearing APIs (cookies, localStorage/sessionStorage, cross-origin network) are stubbed/blocked and the result is redacted. Output is truncated at 50000 chars. Prefer other tools (get_page_content, screenshot) when they suffice.", {
   code: z.string().max(5000).describe("JavaScript to run in the page context. Return a value to have it echoed back. Max 5000 chars"),
-  confirm: z.boolean().describe("Must be true. Acknowledges that this executes arbitrary code with access to the page's cookies and data"),
+  confirm: z.boolean().describe("Must be true. Acknowledges that this executes arbitrary code in the browser context"),
 }, async ({ code, confirm }) => {
   if (!confirm) return textErr("execute_js requires confirm=true. This runs arbitrary JavaScript in the browser context.");
   try {
-    const result = await requirePage().evaluate(code);
-    const output = JSON.stringify(result, null, 2);
-    if (output.length > 50000) return text(`Result (truncated): ${output.substring(0, 50000)}...`);
-    return text(`Result: ${output}`);
+    const PROLOGUE = String.raw`
+      (() => {
+        try {
+          Object.defineProperty(Document.prototype, "cookie", { get(){ return ""; }, set(){}, configurable: true });
+          Object.defineProperty(document, "cookie", { get(){ return ""; }, set(){}, configurable: true });
+          const stub = { get length(){ return 0; }, clear(){}, getItem(){ return null; }, key(){ return null; }, removeItem(){}, setItem(){} };
+          Object.defineProperty(window, "localStorage", { value: stub, configurable: true });
+          Object.defineProperty(window, "sessionStorage", { value: stub, configurable: true });
+          Object.defineProperty(Navigator.prototype, "sendBeacon", { value(){ return false; }, configurable: true });
+          window.WebSocket = class { constructor(){ throw new TypeError("WebSocket blocked"); } };
+          const sameOrigin = (u) => { try { return new URL(String(u), location.href).origin === location.origin; } catch { return false; } };
+          const origFetch = window.fetch.bind(window);
+          window.fetch = (url, opts) => sameOrigin(url) ? origFetch(url, opts)
+            : Promise.reject(new TypeError("fetch blocked: non-localhost request"));
+          const OrigXHR = window.XMLHttpRequest;
+          class SafeXHR extends OrigXHR { open(m, url, ...r) { if (!sameOrigin(url)) throw new TypeError("XHR blocked: non-localhost request"); return super.open(m, url, ...r); } }
+          window.XMLHttpRequest = SafeXHR;
+          const Img = window.Image;
+          window.Image = class extends Img { set src(v) { if (!sameOrigin(v)) throw new TypeError("beacon blocked"); super.src = v; } };
+        } catch (e) {}
+      })();
+    `;
+    const raw = await requirePage().evaluate(({ prologue, userCode }) => {
+      if (!window.__jsGuardInstalled) {
+        try { (0, eval)(prologue); window.__jsGuardInstalled = true; } catch {}
+      }
+      return eval(userCode);
+    }, { prologue: PROLOGUE, userCode: code });
+    const normalized = raw === undefined ? "undefined" : raw;
+    let out;
+    try { out = JSON.stringify(normalized, null, 2); } catch { return textErr("Result is not JSON-serializable; only primitive/array/object values are returned."); }
+    if (out === undefined) return textErr("Result is not serializable (functions/undefined are not returned).");
+    const redactSecret = (s) => s
+      .replace(/(\\?["'])([^"'\\]*(?:token|secret|auth|credential|cookie|session|password|csrf|jwt|api[_-]?key)[^"'\\]*)\1\s*:\s*\1([^"'\\]{4,})\1/gi, '"$2": "[redacted]"')
+      .replace(/(\\?["'])?[Ss]et-Cookie["']?\s*:\s*["'][^"']{2,}["']/g, '"Set-Cookie": "[redacted]"')
+      .replace(/["']Authorization["']\s*:\s*["'][^"']+["']/gi, '"Authorization": "[redacted]"');
+    out = redactSecret(out);
+    if (typeof raw === "string") {
+      const redactedRaw = redactSecret(raw);
+      if (redactedRaw !== raw) {
+        const re = JSON.stringify(redactedRaw, null, 2);
+        if (re !== out) out = re;
+      }
+    }
+    if (out.length > 50000) return text(`Result (truncated): ${out.substring(0, 50000)}...`);
+    return text(`Result: ${out}`);
   } catch (e) { return textErr(`JS error: ${e.message}`); }
 });
 
@@ -827,14 +1112,20 @@ server.tool("wait_for", "Wait until an element matching a CSS selector appears i
   timeout: z.number().optional().default(10000).describe("Max wait time in ms (default 10000)"),
 }, async ({ selector, timeout }) => {
   try { await requirePage().locator(selector).first().waitFor({ timeout }); return text(`Element found: ${selector}`); }
-  catch { return textErr(`Timeout waiting for: ${selector}`); }
+  catch (e) {
+    if (e?.name === "TimeoutError") return textErr(`Timeout waiting for: ${selector}`);
+    return textErr(`wait_for failed: ${e?.message || e}`);
+  }
 });
 
 server.tool("wait_for_load", "Wait for the current page to reach the 'load' state (all resources loaded). Use before extracting content from heavy or slow-loading pages.", {
   timeout: z.number().optional().default(30000).describe("Max wait time in ms (default 30000)"),
 }, async ({ timeout }) => {
   try { await requirePage().waitForLoadState("load", { timeout }); return text("Page fully loaded"); }
-  catch (e) { return textErr(`Timeout: ${e.message}`); }
+  catch (e) {
+    if (e?.name === "TimeoutError") return textErr(`Timeout: ${e.message}`);
+    return textErr(`wait_for_load failed: ${e?.message || e}`);
+  }
 });
 
 server.tool("tabs", "Manage tabs in the current window. Actions: list (see all tabs with indexes), open (new tab, optionally with a URL), switch (make a tab active), close (close a tab; the last tab cannot be closed).", {
@@ -845,6 +1136,7 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
   try {
     return await withLock(async () => {
       syncContexts();
+      invalidateTargetsCache();
       const ctx = getContext();
       if (!ctx) return textErr("Not connected. Run connect_brave first.");
 
@@ -860,9 +1152,14 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
 
       if (action === "list") {
         const pages = await pagesInCurrentWindow();
-        const tabs = pages.map((p, i) => {
-          const title = (() => { try { return p.title(); } catch { return Promise.resolve(""); } })();
-          return title.then(t => `${i}: ${p.url()}${t ? ` - ${t}` : ""}${p === currentPage ? " <- active" : ""}`);
+        const tabs = pages.map(async (p, i) => {
+          let title = "";
+          try {
+            title = await p.title();
+          } catch {
+            title = "";
+          }
+          return `${i}: ${p.url()}${title ? ` - ${title}` : ""}${p === currentPage ? " <- active" : ""}`;
         });
         const lines = await Promise.all(tabs);
         let out = `Open tabs in current window (${pages.length}):\n${lines.join("\n")}`;
@@ -872,9 +1169,26 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
         return text(out);
       }
       if (action === "open") {
-        const page = await ctx.newPage();
+        let page = null;
+        if (currentPage && cdpSession) {
+          try {
+            const info = await pageWindowInfo(currentPage);
+            if (info?.targetId) {
+              await cdpSession.send("Target.activateTarget", { targetId: info.targetId });
+              const { targetId } = await cdpSession.send("Target.createTarget", { url: "about:blank", newWindow: false });
+              for (let i = 0; i < 50 && !page; i++) {
+                for (const p of ctx.pages()) {
+                  const pinfo = await pageWindowInfo(p);
+                  if (pinfo?.targetId === targetId) { page = p; break; }
+                }
+                if (!page) await new Promise(r => setTimeout(r, 100));
+              }
+            }
+          } catch (e) { log(`tabs open same-window: ${e.message}`); }
+        }
+        if (!page) page = await ctx.newPage();
         try {
-          if (url) { await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }); await waitForPageReady(page); }
+          if (url) { assertSafeUrl(url); await page.goto(safeNavigateUrl(url), { waitUntil: "domcontentloaded", timeout: 30000 }); await waitForPageReady(page); }
         } catch (e) { await page.close().catch(() => {}); throw e; }
         await applyNativeColorScheme(page);
         currentPage = page;
@@ -911,10 +1225,18 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
     return await withLock(async () => {
       requireBrowser();
       syncContexts();
+      invalidateTargetsCache();
 
       const allWindows = [];
 
       async function targetIdOfPage(page) {
+        try {
+          const targets = await getTargetsBatched();
+          if (targets) {
+            const info = targetInfoForPage(page, targets);
+            if (info) return info.targetId;
+          }
+        } catch {}
         try {
           const s = await page.context().newCDPSession(page);
           try {
@@ -926,9 +1248,11 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
 
       async function pageByTargetId(targetId) {
         if (!targetId) return null;
+        const targets = await getTargetsBatched().catch(() => null);
         for (const ctx of contexts) {
           for (const p of ctx.pages()) {
-            const id = await targetIdOfPage(p);
+            const info = targets && targetInfoForPage(p, targets);
+            const id = info ? info.targetId : await targetIdOfPage(p);
             if (id === targetId) return { page: p, ctx, ctxIndex: contexts.indexOf(ctx) };
           }
         }
@@ -938,71 +1262,20 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
       async function getWindowsFromPort(port) {
           try {
             let windowMap = new Map();
-            if (cdpSession) {
-              const { targetInfos } = await cdpSession.send("Target.getTargets");
-              const tabs = targetInfos.filter(t => t.type === "page");
-              const results = await Promise.allSettled(tabs.map(t =>
-                cdpSession.send("Browser.getWindowForTarget", { targetId: t.targetId })
-                  .then(({ windowId }) => ({ t, windowId }))
-                  .catch(() => ({ t, windowId: null }))
-              ));
-              for (const r of results) {
-                const { t, windowId } = r.status === "fulfilled" ? r.value : { t: null, windowId: null };
-                if (!t) continue;
-                if (windowId) {
-                  if (!windowMap.has(windowId)) windowMap.set(windowId, { tabs: [], windowId });
-                  windowMap.get(windowId).tabs.push({ url: t.url, title: t.title, id: t.targetId });
-                } else {
-                  const unknownId = "unknown";
-                  if (!windowMap.has(unknownId)) windowMap.set(unknownId, { tabs: [], windowId: unknownId });
-                  windowMap.get(unknownId).tabs.push({ url: t.url, title: t.title, id: t.targetId });
-                }
+            const targets = await getTargetsBatched();
+            if (targets) {
+              for (const t of targets.values()) {
+                const id = t.windowId || "unknown";
+                if (!windowMap.has(id)) windowMap.set(id, { tabs: [], windowId: id });
+                windowMap.get(id).tabs.push({ url: t.url, title: t.title, id: t.targetId });
               }
             } else {
-              const targets = await fetch(`http://localhost:${port}/json`).then(r => r.json()).catch(() => []);
-              const pages = targets.filter(t => t.type === "page" && t.webSocketDebuggerUrl);
-              const version = await fetch(`http://localhost:${port}/json/version`).then(r => r.json()).catch(() => null);
-              const wsUrl = version?.webSocketDebuggerUrl;
-              if (!wsUrl) throw new Error("no browser websocket");
-              const ws = new WebSocket(wsUrl);
-              let nextId = 1;
-              const pending = new Map();
-              await new Promise((resolve, reject) => {
-                const to = setTimeout(() => reject(new Error("ws timeout")), 3000);
-                ws.on("open", () => { clearTimeout(to); resolve(); });
-                ws.on("error", (e) => { clearTimeout(to); reject(e); });
-              });
-              ws.on("message", (data) => {
-                try {
-                  const msg = JSON.parse(data.toString());
-                  if (msg.id && pending.has(msg.id)) {
-                    pending.get(msg.id)(msg);
-                    pending.delete(msg.id);
-                  }
-                } catch {}
-              });
-              const send = (method, params) => new Promise((resolve, reject) => {
-                const id = nextId++;
-                const to = setTimeout(() => { pending.delete(id); reject(new Error("cdp timeout")); }, 3000);
-                pending.set(id, (msg) => { clearTimeout(to); msg.error ? reject(new Error(msg.error.message)) : resolve(msg.result); });
-                ws.send(JSON.stringify({ id, method, params }));
-              });
-              try {
-                for (const t of pages) {
-                  try {
-                    const { windowId } = await send("Browser.getWindowForTarget", { targetId: t.id });
-                    if (windowId) {
-                      if (!windowMap.has(windowId)) windowMap.set(windowId, { tabs: [], windowId });
-                      windowMap.get(windowId).tabs.push({ url: t.url, title: t.title, id: t.id });
-                    }
-                  } catch {
-                    const unknownId = "unknown";
-                    if (!windowMap.has(unknownId)) windowMap.set(unknownId, { tabs: [], windowId: unknownId });
-                    windowMap.get(unknownId).tabs.push({ url: t.url, title: t.title, id: t.id });
-                  }
-                }
-              } finally {
-                try { ws.close(); } catch {}
+              const wsTargets = await fetch(`http://localhost:${port}/json`).then(r => r.json()).catch(() => []);
+              const pages = wsTargets.filter(t => t.type === "page" && t.webSocketDebuggerUrl);
+              for (const t of pages) {
+                const unknownId = "unknown";
+                if (!windowMap.has(unknownId)) windowMap.set(unknownId, { tabs: [], windowId: unknownId });
+                windowMap.get(unknownId).tabs.push({ url: t.url, title: t.title, id: t.id });
               }
             }
 
@@ -1018,8 +1291,14 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
         if (allWindows.length === 0) return text("No windows detected. Run connect_brave first.");
         lastWindowsList = allWindows.slice();
 
+        let currentWindowId = null;
+        if (currentPage) {
+          const curInfo = await pageWindowInfo(currentPage);
+          if (curInfo?.windowId) currentWindowId = curInfo.windowId;
+        }
         const lines = allWindows.map((w, i) => {
-          const marker = w.tabs.some(t => t.url === currentPage?.url()) ? " <- active" : "";
+          const byId = currentWindowId != null && w.windowId === currentWindowId;
+          const marker = (byId || (currentWindowId == null && w.tabs.some(t => t.url === currentPage?.url()))) ? " <- active" : "";
           const tabCount = w.tabs.length;
           const tabList = w.tabs.map((t, j) => `    ${j}: ${t.url}${t.title ? ` - ${t.title}` : ""}`).join("\n");
           return `Window ${i}${marker} (${tabCount} tab${tabCount !== 1 ? 's' : ''}):\n${tabList}`;
@@ -1055,16 +1334,26 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
             await applyNativeColorScheme(currentPage);
             await currentPage.bringToFront();
           } else {
-            const shared = await ensureSharedContexts();
-            if (shared.length === 0) return textErr("No browser context available to open a tab in.");
-            contexts = shared;
-            currentContextIndex = 0;
-            currentPage = contexts[0].pages()[0] || null;
-            if (!currentPage) {
-              currentPage = await contexts[0].newPage();
-              await currentPage.goto(tab.url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+            let picked = null;
+            if (win.windowId && win.windowId !== "unknown") {
+              for (const ctx of contexts) {
+                for (const p of ctx.pages()) {
+                  const info = await pageWindowInfo(p);
+                  if (info?.windowId === win.windowId) { picked = { ctx, page: p }; break; }
+                }
+                if (picked) break;
+              }
+              if (!picked) return textErr(`Could not switch to window ${index} (windowId ${win.windowId}): its tabs are not attached to any Playwright context and cannot be activated.`);
+            } else {
+              const ctx = contexts.find(c => c.pages().length > 0);
+              const page = ctx && ctx.pages()[0];
+              if (!page) return textErr(`Could not switch to window ${index}: window id is unknown and no page was found in any context.`);
+              picked = { ctx, page };
             }
+            currentContextIndex = contexts.indexOf(picked.ctx);
+            currentPage = picked.page;
             await applyNativeColorScheme(currentPage);
+            await currentPage.bringToFront();
           }
         }
         return text(`Switched to window ${index}: ${currentPage.url()}`);
@@ -1088,10 +1377,12 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
             for (const p of fallback.pages().filter(p => p.url() === tab.url)) await p.close().catch(() => {});
           }
         }
-        syncContexts();
         lastWindowsList.splice(index, 1);
-        const activeCtx = getContext();
-        currentPage = activeCtx ? activeCtx.pages()[0] || null : contexts[0]?.pages()[0] || null;
+        const recovered = recoverCurrentPage();
+        if (!recovered) {
+          if (contexts.length === 0) return textErr("All windows closed. No pages remaining. Run connect_brave to reconnect.");
+          return textErr("All pages are closed. Open a new tab to continue automation.");
+        }
         return text(`Closed window ${index}. Now on window ${Math.min(index, lastWindowsList.length - 1)}`);
       }
     });
@@ -1112,7 +1403,7 @@ server.tool("detect_captcha", "Check whether the current page shows a CAPTCHA an
 });
 
 server.tool("wait_for_captcha", "Wait for the current page's CAPTCHA to be solved by the user. Event-driven via a MutationObserver inside the page (disconnects on solve), so it wastes almost no CPU while waiting. Use after detect_captcha finds an unsolved CAPTCHA — wait for the user to solve it, then continue automation.", {
-  timeout: z.number().min(1).max(600).optional().default(120).describe("Max seconds to wait for the CAPTCHA to be solved (default 120, max 600)"),
+  timeout: z.number().min(1).max(30).optional().default(30).describe("Max seconds to wait for the CAPTCHA to be solved (default 30, cap 30)"),
 }, async ({ timeout }) => {
   try {
     const page = requirePage();
@@ -1172,17 +1463,19 @@ server.tool("search_social", "Search a social media platform or search engine in
       tiktok: `https://www.tiktok.com/search?q=${encodeURIComponent(query)}`,
       youtube: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
     };
-    await page.goto(urls[platform], { waitUntil: "domcontentloaded", timeout: 30000 });
+    assertSafeUrl(urls[platform]);
+    await page.goto(safeNavigateUrl(urls[platform]), { waitUntil: "domcontentloaded", timeout: 30000 });
     const selectors = { google: '#search, #rso', tiktok: '[class*="DivItemContainer"], [class*="video-feed"]', youtube: 'ytd-video-renderer, ytd-channel-renderer' };
     try { await page.locator(selectors[platform] || '[role="main"], main, #results').first().waitFor({ timeout: 10000 }); } catch {}
-    let result = `Search results for "${query}" on ${platform}:\n\n${(await page.locator("body").evaluate((n) => (n?.innerText || "").slice(0, 8000)))}`;
+    const region = selectors[platform] || '[role="main"], main, #results';
+    let result = `Search results for "${query}" on ${platform}:\n\n${await page.evaluate(extractVisibleText, { region, limit: 8000, fallbackToBody: true })}`;
     const captchaResult = await autoWaitForCaptcha();
     if (captchaResult) result += `\nCAPTCHA: ${captchaResult}`;
     return text(result);
   } catch (e) { return textErr(`Error: ${e.message}`); }
 });
 
-server.tool("cookies", "Persist browser cookies for session reuse. save stores the current window's cookies under a named profile; load restores them (e.g. to keep login sessions alive between runs). Cookies are stored locally under the cookies directory.", {
+server.tool("cookies", "Persist browser cookies for session reuse. save stores the current window's cookies under a named profile; load restores them (e.g. to keep login sessions alive between runs). Cookies are obfuscated at rest with a key derived from the local user + package name — not cryptographic protection. Stored under the cookies directory.", {
   action: z.enum(["save", "load"]).describe("save = store current cookies, load = restore saved cookies"),
   profile: z.string().describe("Profile name to save to or load from (alphanumeric, dots, dashes, underscores only)"),
 }, async ({ action, profile }) => {
