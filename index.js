@@ -300,15 +300,33 @@ process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 
 const server = new McpServer({ name: "browser-navigator", version: pkg.version });
 
+async function ensureSharedContexts() {
+  const live = browser.contexts();
+  if (live.length > 0) return live;
+  if (connectedViaCDP && cdpSession) {
+    try {
+      await cdpSession.send("Target.createTarget", { url: "about:blank" });
+      for (let i = 0; i < 50 && browser.contexts().length === 0; i++) {
+        await new Promise(r => setTimeout(r, 100));
+      }
+    } catch (e) { log(`ensureSharedContexts: ${e.message}`); }
+    const after = browser.contexts();
+    if (after.length > 0) return after;
+  }
+  log("ensureSharedContexts: no contexts available; returning empty");
+  return [];
+}
+
 async function finalizeConnection() {
   cdpSession = await browser.newBrowserCDPSession();
-  contexts = browser.contexts().length > 0 ? browser.contexts() : [await browser.newContext()];
+  contexts = await ensureSharedContexts();
   for (const ctx of contexts) {
     const id = getCtxId(ctx) || `ctx_${nextContextId++}`;
     if (!getCtxId(ctx)) contextIdMap.set(ctx, id);
     if (!contextMeta.has(id)) contextMeta.set(id, { isIncognito: false });
   }
   currentContextIndex = 0;
+  if (contexts.length === 0) { currentPage = null; return; }
   currentPage = contexts[0].pages()[0] || await contexts[0].newPage();
   await applyNativeColorSchemeAll();
 }
@@ -1037,7 +1055,16 @@ server.tool("windows", "Manage browser windows. Actions: list (show every window
             await applyNativeColorScheme(currentPage);
             await currentPage.bringToFront();
           } else {
-            currentPage = contexts[0].pages()[0] || await contexts[0].newPage();
+            const shared = await ensureSharedContexts();
+            if (shared.length === 0) return textErr("No browser context available to open a tab in.");
+            contexts = shared;
+            currentContextIndex = 0;
+            currentPage = contexts[0].pages()[0] || null;
+            if (!currentPage) {
+              currentPage = await contexts[0].newPage();
+              await currentPage.goto(tab.url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+            }
+            await applyNativeColorScheme(currentPage);
           }
         }
         return text(`Switched to window ${index}: ${currentPage.url()}`);

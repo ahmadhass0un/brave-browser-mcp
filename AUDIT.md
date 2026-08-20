@@ -63,3 +63,4 @@
 | 42 | **WebSocket-per-tab in `windows list`** | ✅ Reuses the single browser-level CDP session (`Target.getTargets` + `Browser.getWindowForTarget`); falls back to one pooled WS if no session |
 | 43 | **`tabs` mixed tabs from all windows** | ✅ `tabs` now filters to the current window via CDP `Browser.getWindowForTarget` (all windows share one Playwright context) |
 | 44 | **`windows switch/close` used stale cached list** | ✅ `switch`/`close` fetch a fresh window list every call; index now matches live windows |
+| 45 | **Random logouts (TikTok etc.)** | ✅ `browser.newContext()` fallback created an ephemeral incognito context with ZERO cookies whenever `browser.contexts()` was empty at connect — every tab opened there was logged out. Replaced with `ensureSharedContexts()` which reuses the existing shared context (or creates a target via CDP in the same profile) so cookies/sessions persist. |
