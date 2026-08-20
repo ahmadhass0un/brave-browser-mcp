@@ -381,7 +381,22 @@ server.tool("connect_brave", "Connect to Brave browser. Attaches to existing tab
     }
     syncContexts();
     const tabCount = contexts.reduce((n, ctx) => n + ctx.pages().length, 0);
-    return text(`Connected to Brave\nOpen tabs: ${tabCount}\nWindows: ${contexts.length}`);
+    let out = `Connected to Brave\nOpen tabs: ${tabCount}`;
+    if (cdpSession) {
+      try {
+        const { targetInfos } = await cdpSession.send("Target.getTargets");
+        const winIds = new Set();
+        for (const t of targetInfos.filter(x => x.type === "page")) {
+          try { const { windowId } = await cdpSession.send("Browser.getWindowForTarget", { targetId: t.targetId }); winIds.add(windowId); } catch {}
+        }
+        out += `\nWindows: ${winIds.size}`;
+        if (winIds.size > 1) out += `\nMultiple windows detected. Use 'windows list' to see them and 'windows switch' to change windows.`;
+      } catch { out += `\nWindows: ${contexts.length}`; }
+    } else {
+      out += `\nWindows: ${contexts.length}`;
+    }
+    if (currentPage) out += `\nCurrent tab: ${currentPage.url()}`;
+    return text(out);
   } catch (e) { return textErr(`Error: ${e.message}`); }
 });
 
@@ -832,7 +847,11 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
           return title.then(t => `${i}: ${p.url()}${t ? ` - ${t}` : ""}${p === currentPage ? " <- active" : ""}`);
         });
         const lines = await Promise.all(tabs);
-        return text(`Open tabs (${pages.length}):\n${lines.join("\n")}`);
+        let out = `Open tabs in current window (${pages.length}):\n${lines.join("\n")}`;
+        const allPages = ctx.pages();
+        const otherWindows = allPages.length - pages.length;
+        if (otherWindows > 0) out += `\n\nOther windows contain ${otherWindows} more tab${otherWindows !== 1 ? "s" : ""}. Use 'windows list' to see all windows and 'windows switch' to change windows.`;
+        return text(out);
       }
       if (action === "open") {
         const page = await ctx.newPage();
