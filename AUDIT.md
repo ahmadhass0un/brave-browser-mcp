@@ -61,3 +61,5 @@
 | 40 | **1s polling CAPTCHA wait (high CPU)** | ✅ `waitForCaptchaSolved()` waits via MutationObserver (`polling:"mutation"`) with a 5s safety poll instead of 1s full-DOM polling |
 | 41 | **`detectCaptcha` serialized full DOM** | ✅ Removed `document.documentElement.outerHTML` and `getComputedStyle` loops; uses targeted selectors + `offsetWidth/offsetHeight` visibility checks |
 | 42 | **WebSocket-per-tab in `windows list`** | ✅ Reuses the single browser-level CDP session (`Target.getTargets` + `Browser.getWindowForTarget`); falls back to one pooled WS if no session |
+| 43 | **`tabs` mixed tabs from all windows** | ✅ `tabs` now filters to the current window via CDP `Browser.getWindowForTarget` (all windows share one Playwright context) |
+| 44 | **`windows switch/close` used stale cached list** | ✅ `switch`/`close` fetch a fresh window list every call; index now matches live windows |

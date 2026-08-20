@@ -88,6 +88,17 @@ async function applyNativeColorSchemeAll() {
   await Promise.allSettled(pages.map(p => applyNativeColorScheme(p)));
 }
 
+async function pageWindowInfo(page) {
+  try {
+    const s = await page.context().newCDPSession(page);
+    try {
+      const { targetInfo } = await s.send("Target.getTargetInfo");
+      const { windowId } = await s.send("Browser.getWindowForTarget", { targetId: targetInfo.targetId });
+      return { targetId: targetInfo.targetId, windowId };
+    } finally { await s.detach().catch(() => {}); }
+  } catch { return null; }
+}
+
 async function waitForPageReady(page, timeout = 30000, waitUntil = "domcontentloaded") {
   try {
     if (waitUntil === "commit") return;
@@ -804,8 +815,18 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
       const ctx = getContext();
       if (!ctx) return textErr("Not connected. Run connect_brave first.");
 
+      const pagesInCurrentWindow = async () => {
+        const all = ctx.pages();
+        if (!currentPage) return all;
+        const current = await pageWindowInfo(currentPage);
+        if (!current?.windowId) return all;
+        const infos = await Promise.all(all.map(p => pageWindowInfo(p)));
+        const filtered = all.filter((p, i) => infos[i]?.windowId === current.windowId);
+        return filtered.length > 0 ? filtered : all;
+      };
+
       if (action === "list") {
-        const pages = ctx.pages();
+        const pages = await pagesInCurrentWindow();
         const tabs = pages.map((p, i) => {
           const title = (() => { try { return p.title(); } catch { return Promise.resolve(""); } })();
           return title.then(t => `${i}: ${p.url()}${t ? ` - ${t}` : ""}${p === currentPage ? " <- active" : ""}`);
@@ -826,14 +847,14 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
         return text(result);
       }
       if (action === "switch") {
-        const pages = ctx.pages();
+        const pages = await pagesInCurrentWindow();
         if (index === undefined || index < 0 || index >= pages.length) return textErr(`Invalid index. Available: 0-${pages.length - 1}`);
         currentPage = pages[index];
         await currentPage.bringToFront();
         return text(`Switched to tab ${index}: ${currentPage.url()}`);
       }
       if (action === "close") {
-        const pages = ctx.pages();
+        const pages = await pagesInCurrentWindow();
         if (pages.length <= 1) return textErr("Cannot close the last tab");
         if (index === undefined || index < 0 || index >= pages.length) return textErr(`Invalid index. Available: 0-${pages.length - 1}`);
         const page = pages[index];
