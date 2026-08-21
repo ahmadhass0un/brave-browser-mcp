@@ -1448,24 +1448,47 @@ server.tool("video_control", "Control playback on any HTML5 video player (YouTub
   } catch (e) { return textErr(`Video control error: ${e.message}`); }
 });
 
-server.tool("search_social", "Search a social media platform or search engine in the current tab and return the visible text of the results page (truncated to 8000 chars). Platforms: google, twitter, instagram (hashtag), facebook, linkedin, tiktok, youtube.", {
-  platform: z.enum(["google", "twitter", "instagram", "facebook", "linkedin", "tiktok", "youtube"]).describe("Platform to search on"),
+server.tool("search", "Search popular websites and social media platforms in the current tab and returns visible text of the results (truncated to 8000 chars). Engines: google, bing, duckduckgo, yahoo, brave, yandex, perplexity. Social: twitter, instagram (hashtag), facebook, linkedin, tiktok, reddit. Video: youtube. Dev: github, stackoverflow. Reference: wikipedia.", {
+  platform: z.enum(["google", "bing", "duckduckgo", "yahoo", "brave", "yandex", "perplexity", "twitter", "instagram", "facebook", "linkedin", "tiktok", "reddit", "youtube", "github", "stackoverflow", "wikipedia"]).describe("Platform or search engine to search on"),
   query: z.string().describe("Search query — for instagram use a hashtag without the # symbol"),
 }, async ({ platform, query }) => {
   try {
     const page = requirePage();
+    const q = encodeURIComponent(query);
     const urls = {
-      google: `https://www.google.com/search?q=${encodeURIComponent(query)}`,
-      twitter: `https://twitter.com/search?q=${encodeURIComponent(query)}&src=typed_query`,
-      instagram: `https://www.instagram.com/explore/tags/${encodeURIComponent(query.replace(/#/g, ""))}/`,
-      facebook: `https://www.facebook.com/search/top?q=${encodeURIComponent(query)}`,
-      linkedin: `https://www.linkedin.com/search/results/all/?keywords=${encodeURIComponent(query)}`,
-      tiktok: `https://www.tiktok.com/search?q=${encodeURIComponent(query)}`,
-      youtube: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+      google:      `https://www.google.com/search?q=${q}`,
+      bing:        `https://www.bing.com/search?q=${q}`,
+      duckduckgo:  `https://duckduckgo.com/?q=${q}`,
+      yahoo:       `https://search.yahoo.com/search?p=${q}`,
+      brave:       `https://search.brave.com/search?q=${q}`,
+      yandex:      `https://yandex.com/search/?text=${q}`,
+      perplexity:  `https://www.perplexity.ai/search?q=${q}`,
+      twitter:     `https://twitter.com/search?q=${q}&src=typed_query`,
+      instagram:   `https://www.instagram.com/explore/tags/${encodeURIComponent(query.replace(/#/g, ""))}/`,
+      facebook:    `https://www.facebook.com/search/top?q=${q}`,
+      linkedin:    `https://www.linkedin.com/search/results/all/?keywords=${q}`,
+      tiktok:      `https://www.tiktok.com/search?q=${q}`,
+      reddit:      `https://www.reddit.com/search/?q=${q}`,
+      youtube:     `https://www.youtube.com/results?search_query=${q}`,
+      github:      `https://github.com/search?q=${q}&type=repositories`,
+      stackoverflow: `https://stackoverflow.com/search?q=${q}`,
+      wikipedia:   `https://en.wikipedia.org/w/index.php?search=${q}`,
     };
     assertSafeUrl(urls[platform]);
     await page.goto(safeNavigateUrl(urls[platform]), { waitUntil: "domcontentloaded", timeout: 30000 });
-    const selectors = { google: '#search, #rso', tiktok: '[class*="DivItemContainer"], [class*="video-feed"]', youtube: 'ytd-video-renderer, ytd-channel-renderer' };
+    const selectors = {
+      google: '#search, #rso',
+      bing: '#b_results',
+      duckduckgo: '#links, #web_content',
+      yahoo: '#web',
+      brave: '#results',
+      yandex: '#search-results',
+      perplexity: '[data-testid="answer"]',
+      tiktok: '[class*="DivItemContainer"], [class*="video-feed"]',
+      youtube: 'ytd-video-renderer, ytd-channel-renderer',
+      github: '#results, .results',
+      stackoverflow: '#answers, .search-results',
+    };
     try { await page.locator(selectors[platform] || '[role="main"], main, #results').first().waitFor({ timeout: 10000 }); } catch {}
     const region = selectors[platform] || '[role="main"], main, #results';
     let result = `Search results for "${query}" on ${platform}:\n\n${await page.evaluate(extractVisibleText, { region, limit: 8000, fallbackToBody: true })}`;

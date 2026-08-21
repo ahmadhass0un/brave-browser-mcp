@@ -122,7 +122,7 @@ All 27 tools:
 | `detect_captcha` | Check CAPTCHA presence & solved status |
 | `wait_for_captcha` | Poll until the user solves a CAPTCHA |
 | `video_control` | Play/pause/seek/volume/fullscreen on HTML5 video |
-| `search_social` | Search Google, X, Instagram, Facebook, LinkedIn, TikTok, YouTube |
+| `search` | Search Google, Bing, DuckDuckGo, Yahoo, Brave, Yandex, Perplexity, Twitter/X, Instagram, Facebook, LinkedIn, TikTok, Reddit, YouTube, GitHub, Stack Overflow, Wikipedia |
 | `cookies` | Save/load session cookies (stored under `cookies/`) |
 | `health` | Server + connection status, open window/tab counts |
 

@@ -43,7 +43,7 @@
 | 22 | `navigate` missing `waitUntil` option | ✅ Added `wait_until` param with `load|domcontentloaded|networkidle|commit` |
 | 23 | `get_page_content` no HTML extraction | ✅ Added `format: "text"|"html"` param |
 | 24 | Missing `hover`, `drag_and_drop`, `find_element`, `pdf_export` | ✅ Added `hover` and `pdf_export` tools |
-| 25 | `search_social` redundant | ⚠️ Kept for convenience |
+| 25 | `search_social` redundant | ⚠️ Kept for convenience (renamed to `search`) |
 | 26 | `scroll` missing `left`/`right` | ✅ Added |
 | 27 | `click` missing `doubleClick`/`button` | ✅ Added `double_click` and `button` params |
 | 28 | `type` missing `delay` param | ✅ Added `delay` param for keystroke-by-keystroke typing |
@@ -65,7 +65,7 @@
 | 44 | **`windows switch/close` used stale cached list** | ✅ `switch`/`close` fetch a fresh window list every call; index now matches live windows |
 | 45 | **Random logouts (TikTok etc.)** | ✅ `browser.newContext()` fallback created an ephemeral incognito context with ZERO cookies whenever `browser.contexts()` was empty at connect — every tab opened there was logged out. Replaced with `ensureSharedContexts()` which reuses the existing shared context (or creates a target via CDP in the same profile) so cookies/sessions persist. |
 | 46 | **SEC S1** `execute_js` arbitrary JS in logged-in browser | ✅ HIGH → stubs `document.cookie`/`localStorage`/`sessionStorage`/`sendBeacon`/`WebSocket`, blocks cross-origin `fetch`/`XHR`/`Image`; redacts token/secret/cookie/auth/Set-Cookie values in output; requires `confirm=true`. |
-| 47 | **SEC S2** `file://` navigation → local file disclosure | ✅ MED → `safeNavigateUrl()` scheme allowlist (http/https/about/blob; file denied) applied to `navigate`, `tabs open`, `windows switch`, `search_social`. |
+| 47 | **SEC S2** `file://` navigation → local file disclosure | ✅ MED → `safeNavigateUrl()` scheme allowlist (http/https/about/blob; file denied) applied to `navigate`, `tabs open`, `windows switch`, `search`. |
 | 48 | **SEC S3** SSRF through browser to cloud metadata/internal LAN | ✅ MED → `assertSafeUrl()` blocks metadata IPs (169.254.169.254), loopback, private CIDRs, decimal-obfuscated IPs on all goto paths; `execute_js` blocks cross-origin fetch. |
 | 49 | **SEC S4** CDP port 9222 unauthenticated, left open after sessions | ⚠️ MED → added `--remote-debugging-address=127.0.0.1` + `--remote-allow-origins` on launch; port stays open by design (tabs must survive); full fix needs auth proxy. |
 | 50 | **SEC S5** session cookies saved as plaintext JSON | ✅ LOW → AES-256-GCM + scrypt (key derived from homedir+package) via `encryptCookies`/`decryptCookies`; legacy plaintext files still load; honest about non-crypto obfuscation. |
@@ -79,5 +79,5 @@
 | 58 | **PERF P1** CDP session per page (N+1, quadratic) in windows/tabs | ✅ HIGH → `getTargetsBatched()` caches one `Target.getTargets` + per-window `Browser.getWindowForTarget`; `targetIdOfPage`/`pageByTargetId`/`getWindowsFromPort`/`pageWindowInfo` all use it; cache invalidated per tool call. |
 | 59 | **PERF P2** `navigate` double-waits domcontentloaded + complete | ✅ HIGH → `waitForPageReady` only polls `readyState==='complete'` for `load`/`networkidle`; `navigate` skips follow-up for domcontentloaded/commit. |
 | 60 | **PERF P3** `click` runs `waitForPageReady` twice (up to +6s dead time) | ✅ MED → single `waitForPageReady(page, 5000, "load")` at top of `click`. |
-| 61 | **PERF P4** `innerText` of whole body forces full layout | ✅ MED → `extractVisibleText()` bounded DOM walk (budget-limited, skips script/style/hidden, block-level newlines) used by `get_page_content` and `search_social`. |
+| 61 | **PERF P4** `innerText` of whole body forces full layout | ✅ MED → `extractVisibleText()` bounded DOM walk (budget-limited, skips script/style/hidden, block-level newlines) used by `get_page_content` and `search`. |
 | 62 | **PERF P5** `contextMeta` never pruned; captcha wait up to 120s | ✅ LOW → `pruneContextMeta()` in `syncContexts`/`finalizeConnection`; captcha waits capped at 30s (`waitForCaptchaSolved` default + tool schema max). |
