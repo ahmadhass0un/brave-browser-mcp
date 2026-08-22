@@ -1,15 +1,18 @@
 {
   "name": "browser-navigator-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
-  "description": "MCP server for Brave browser automation via CDP: tabs, windows, DOM discovery, CAPTCHA detection, cookies, and video control",
+  "description": "MCP server for Brave/Chrome browser automation via extension bridge",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "serve": "node index.js",
+    "host": "node native-host.js",
+    "test": "node test.cjs",
+    "syntax": "for f in index.js server.js ws-server.js bridge.js tools.js lib/proto.js lib/security.js lib/tfidf.js; do node --check $f; done"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "playwright": "^1.40.0",
     "ws": "^8.21.3",
     "zod": "^3.22.0"
   }

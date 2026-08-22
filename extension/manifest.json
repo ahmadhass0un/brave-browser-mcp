@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Navigator MCP Bridge",
+  "version": "2.0.0",
+  "description": "Bridge between the browser-navigator MCP server and this browser.",
+  "minimum_chrome_version": "118",
+  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["tabs", "windows", "scripting", "debugger", "cookies", "storage", "webRequest", "nativeMessaging"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [{
+    "matches": ["http://*/*", "https://*/*"],
+    "js": ["content.js"],
+    "run_at": "document_idle",
+    "all_frames": true,
+    "match_about_blank": true
+  }],
+  "options_page": "options.html",
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}
