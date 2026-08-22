@@ -102,7 +102,8 @@ All 27 tools:
 | `disconnect` | Disconnect from the browser (windows/tabs stay open) |
 | `navigate` | Go to a URL; auto-detects CAPTCHAs and waits up to 120s for solving |
 | `navigate_history` | Back / forward; fast on bfcache pages |
-| `click` | Click by CSS selector or visible text; double-click & mouse button options |
+| `click` | Click by CSS selector, visible text, or ref (ref_N from read_page); double-click & mouse buttons |
+| `computer` | Unified interaction: click/drag/scroll/type/key/fill/hover/wait/screenshot by selector, coordinates, or ref |
 | `type` | Type text; optional per-keystroke delay and Enter |
 | `focus_element` | Focus an element (needed for custom widgets like tag/chip inputs) |
 | `press_key` | Send keys: Escape, Tab, Backspace, Arrow keys, combos, sequences |
@@ -110,19 +111,29 @@ All 27 tools:
 | `hover` | Hover to reveal menus and tooltips |
 | `get_page_info` | URL, title, load status, CAPTCHA presence |
 | `get_page_content` | Extract visible text or raw HTML (10k char cap) |
+| `read_page` | Accessibility tree with stable ref IDs (ref_1, ref_2...); filter interactive/all |
 | `list_elements` | List interactive elements with reusable CSS selectors |
 | `inspect_dom` | Inspect an element's structure, attributes, and children |
 | `screenshot` | PNG of the page or an element (saved under `screenshots/`) |
 | `pdf_export` | Save the page as a PDF (saved under `screenshots/`) |
 | `execute_js` | Run arbitrary JS in the page (requires `confirm=true`) |
+| `inject_script` | Inject persistent content script (survives navigations, isolated world) |
+| `send_to_injected` | Send message to injected script and await reply |
 | `wait_for` | Wait until an element appears in the DOM |
 | `wait_for_load` | Wait for full page load |
-| `tabs` | List / open / switch / close tabs |
+| `network_start` | Start capturing HTTP requests via CDP (Fetch+Network) |
+| `network_stop` | Stop capture, return all requests as JSON |
+| `network_list` | Peek at captured requests without stopping |
+| `network_request` | Send custom HTTP request through browser (cookies apply) |
+| `search_tabs` | Semantic search across ALL open tabs (TF-IDF cosine similarity) |
+| `tabs` | List / open / switch / close tabs (background mode supported) |
 | `windows` | List / switch / close windows |
 | `detect_captcha` | Check CAPTCHA presence & solved status |
 | `wait_for_captcha` | Poll until the user solves a CAPTCHA |
 | `video_control` | Play/pause/seek/volume/fullscreen on HTML5 video |
-| `search` | Search Google, Bing, DuckDuckGo, Yahoo, Brave, Yandex, Perplexity, Twitter/X, Instagram, Facebook, LinkedIn, TikTok, Reddit, YouTube, GitHub, Stack Overflow, Wikipedia |
+| `search` | Search 17 platforms: Google, Bing, DuckDuckGo, Yahoo, Brave, Yandex, Perplexity, Twitter/X, Instagram, Facebook, LinkedIn, TikTok, Reddit, YouTube, GitHub, Stack Overflow, Wikipedia |
+| `bookmark_add` / `bookmark_delete` / `bookmark_search` / `bookmark_list` | Local bookmark store with Chrome/Brave import |
+| `history_search` | Search browsing history (time-filtered, persisted) |
 | `cookies` | Save/load session cookies (stored under `cookies/`) |
 | `health` | Server + connection status, open window/tab counts |
 
