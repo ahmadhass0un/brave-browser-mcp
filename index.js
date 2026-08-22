@@ -16,8 +16,10 @@ import os from "node:os";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const COOKIES_DIR = join(__dirname, "../../cookies");
 const SCREENSHOTS_DIR = join(__dirname, "../../screenshots");
+const BOOKMARKS_DIR = join(__dirname, "../../bookmarks");
+const HISTORY_DIR = join(__dirname, "../../history");
 
-for (const dir of [COOKIES_DIR, SCREENSHOTS_DIR]) {
+for (const dir of [COOKIES_DIR, SCREENSHOTS_DIR, BOOKMARKS_DIR, HISTORY_DIR]) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
@@ -35,6 +37,13 @@ const contextMeta = new Map();
 const contextIdMap = new WeakMap();
 let nextContextId = 1;
 let lastWindowsList = [];
+
+let networkCapture = { active: false, requests: [], cdpSession: null, timeout: null };
+let refMap = new Map();
+let refCounter = 0;
+let injectedScripts = new Map();
+let bookmarks = [];
+let browsingHistory = [];
 
 let _opLock = Promise.resolve();
 function withLock(fn) {
@@ -338,6 +347,29 @@ function saveCookiesFn(profileName, cookies) {
   const p = safePath(COOKIES_DIR, `${safe}.json`);
   writeFileSync(p, encryptCookies(cookies), { mode: 0o600 });
 }
+
+function loadBookmarksFile() {
+  const p = safePath(BOOKMARKS_DIR, "bookmarks.json");
+  if (!existsSync(p)) return [];
+  try { const data = JSON.parse(readFileSync(p, "utf-8")); if (Array.isArray(data)) return data; } catch (e) { log(`loadBookmarksFile: ${e.message}`); }
+  return [];
+}
+function saveBookmarksFile() { try { writeFileSync(safePath(BOOKMARKS_DIR, "bookmarks.json"), JSON.stringify(bookmarks, null, 2)); } catch (e) { log(`saveBookmarksFile: ${e.message}`); } }
+function loadHistoryFile() {
+  const p = safePath(HISTORY_DIR, "history.json");
+  if (!existsSync(p)) return [];
+  try { const data = JSON.parse(readFileSync(p, "utf-8")); if (Array.isArray(data)) return data; } catch (e) { log(`loadHistoryFile: ${e.message}`); }
+  return [];
+}
+function saveHistoryFile() { try { writeFileSync(safePath(HISTORY_DIR, "history.json"), JSON.stringify(browsingHistory.slice(-5000), null, 2)); } catch (e) { log(`saveHistoryFile: ${e.message}`); } }
+function walkChromeBookmarkFolder(node, folder, out) {
+  if (!node || typeof node !== "object") return;
+  const childFolder = node.type === "folder" && node.name ? `${folder}${folder ? "/" : ""}${node.name}` : folder;
+  if (Array.isArray(node.children)) { for (const child of node.children) walkChromeBookmarkFolder(child, childFolder, out); return; }
+  if (typeof node.url === "string" && node.url) out.push({ url: node.url, title: node.name || "", folder });
+}
+bookmarks = loadBookmarksFile();
+browsingHistory = loadHistoryFile();
 
 function findContextById(ctxId) {
   return contexts.find((c) => getCtxId(c) === ctxId) || null;
@@ -656,20 +688,46 @@ server.tool("disconnect", "Disconnect the MCP from the browser. Browser windows 
   } catch (e) { return textErr(`Error disconnecting: ${e.message}`); }
 });
 
-server.tool("navigate", "Navigate the current tab to a URL. Waits for the page to load, then automatically detects CAPTCHAs and waits up to 120s for the user to solve them. Use wait_until='networkidle' for pages with heavy JS, 'load' for full resources, or 'domcontentloaded' (default) for speed.", {
+function stopNetworkCapture() {
+  if (networkCapture.timeout) { clearTimeout(networkCapture.timeout); networkCapture.timeout = null; }
+  const session = networkCapture.cdpSession;
+  const requests = networkCapture.requests;
+  networkCapture.active = false; networkCapture.requests = []; networkCapture.cdpSession = null;
+  if (session) {
+    try { session.removeAllListeners("Fetch.requestPaused"); } catch {}
+    try { session.removeAllListeners("Network.responseReceived"); } catch {}
+    try { session.removeAllListeners("Network.loadingFinished"); } catch {}
+    try { session.send("Fetch.disable").catch(() => {}); } catch {}
+    try { session.send("Network.disable").catch(() => {}); } catch {}
+    try { session.detach().catch(() => {}); } catch {}
+  }
+  return requests;
+}
+
+server.tool("navigate", "Navigate the current tab to a URL. Waits for the page to load, then automatically detects CAPTCHAs and waits up to 120s for the user to solve them. Use wait_until='networkidle' for pages with heavy JS, 'load' for full resources, or 'domcontentloaded' (default) for speed. Set background=true to navigate without changing which tab is focused/active.", {
   url: z.string().describe("Full URL to navigate to (e.g. https://example.com)"),
   wait_until: z.enum(["load", "domcontentloaded", "networkidle", "commit"]).optional().default("domcontentloaded").describe("When to consider navigation complete: load=all resources, domcontentloaded=HTML parsed (default), networkidle=no network for 500ms, commit=initial response"),
   timeout: z.number().min(1000).max(120000).optional().default(30000).describe("Max time in ms before navigation is abandoned (default 30000)"),
-}, async ({ url, wait_until, timeout }) => {
+  background: z.boolean().optional().default(false).describe("If true, navigate without switching/activating tabs (active tab stays unchanged)"),
+}, async ({ url, wait_until, timeout, background }) => {
   try {
-    const page = requirePage();
+    let page;
+    if (background) {
+      syncContexts();
+      page = currentPage && getContext()?.pages().includes(currentPage) ? currentPage : null;
+      if (!page) throw new Error("Not connected. Run connect_brave first.");
+    } else {
+      page = requirePage();
+    }
     assertSafeUrl(url);
     const safeUrl = safeNavigateUrl(url);
     await page.goto(safeUrl, { waitUntil: wait_until, timeout });
     if (wait_until === "load" || wait_until === "networkidle") {
       await waitForPageReady(page, timeout, wait_until);
     }
-    let result = `Navigated to: ${safeUrl}\nTitle: ${await page.title()}`;
+    browsingHistory.push({ url: safeUrl, title: await page.title().catch(() => ""), timestamp: new Date().toISOString() });
+    saveHistoryFile();
+    let result = `Navigated to: ${safeUrl}\nTitle: ${await page.title()}${background ? "\n(background: active tab unchanged)" : ""}`;
     const captchaResult = await autoWaitForCaptcha();
     if (captchaResult) result += `\nCAPTCHA: ${captchaResult}`;
     return text(result);
@@ -704,16 +762,24 @@ server.tool("navigate_history", "Go back or forward in the current tab's history
   } catch (e) { return textErr(`Error navigating: ${e.message}`); }
 });
 
-server.tool("click", "Click an element on the current page. By default uses a CSS selector; set by_text=true to match by visible text OR aria-label instead. Supports double-click and left/right/middle mouse buttons. If a real mouse click is blocked (e.g. by a dialog backdrop or overlay), it retries with a JavaScript click, and the error message hints at what element is intercepting the click. Use scope to click inside an open dialog or container.", {
-  selector: z.string().describe("CSS selector (e.g. '#submit', '.btn', 'a[href*=\"/login\"]') OR visible text / aria-label when by_text=true"),
+server.tool("click", "Click an element on the current page. By default uses a CSS selector; set by_text=true to match by visible text OR aria-label instead. Use ref from read_page for reliable targeting. Supports double-click and left/right/middle mouse buttons. If a real mouse click is blocked, it retries with a JavaScript click.", {
+  selector: z.string().optional().describe("CSS selector (e.g. '#submit', '.btn') OR visible text / aria-label when by_text=true. Omit when ref is provided"),
+  ref: z.string().optional().describe("Element ref (ref_N) from read_page; takes precedence over selector"),
   by_text: z.boolean().optional().default(false).describe("True: match by visible text content or aria-label instead of CSS selector"),
   scope: z.string().optional().describe("CSS selector of a container to search within (e.g. '[role=dialog]' for the currently open dialog)"),
   double_click: z.boolean().optional().default(false).describe("Perform a double-click instead of a single click"),
   button: z.enum(["left", "right", "middle"]).optional().default("left").describe("Mouse button to use (left by default)"),
-}, async ({ selector, by_text, scope, double_click, button }) => {
+}, async ({ selector, ref, by_text, scope, double_click, button }) => {
   const page = requirePage();
   const scoped = scope ? page.locator(scope).first() : null;
   try {
+    if (ref) {
+      const entry = refMap.get(ref);
+      if (!entry) return textErr(`Unknown ref "${ref}". Refs reset on every read_page call and on navigation — call read_page again.`);
+      selector = entry.selector || (entry.role && entry.name ? `role=${entry.role}[name="${String(entry.name).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]` : null);
+      if (!selector) return textErr(`Ref ${ref} (${entry.role}) has no CSS selector or aria name to locate it.`);
+    }
+    if (!selector) return textErr("Provide either 'selector' or 'ref'.");
     await waitForPageReady(page, 5000, "load");
     let clicked = false;
     let jsClicked = false;
@@ -765,7 +831,7 @@ server.tool("click", "Click an element on the current page. By default uses a CS
     if (!clicked && !jsClicked) {
       return textErr(`Element found but click failed: ${selector}${scope ? ` inside "${scope}"` : ""}. Real mouse click was blocked or no-op, and the JS click() fallback also failed.`);
     }
-    let result = `Clicked: ${selector}`;
+    let result = `Clicked${ref ? ` [${ref}]` : ""}: ${selector}`;
     if (jsClicked && !clicked) result += " (via JS click fallback)";
     const captchaResult = await autoWaitForCaptcha();
     if (captchaResult) result += `\nCAPTCHA: ${captchaResult}`;
@@ -1128,11 +1194,12 @@ server.tool("wait_for_load", "Wait for the current page to reach the 'load' stat
   }
 });
 
-server.tool("tabs", "Manage tabs in the current window. Actions: list (see all tabs with indexes), open (new tab, optionally with a URL), switch (make a tab active), close (close a tab; the last tab cannot be closed).", {
+server.tool("tabs", "Manage tabs in the current window. Actions: list (see all tabs with indexes), open (new tab, optionally with a URL), switch (make a tab active), close (close a tab; the last tab cannot be closed). Set background=true to open a tab without focusing it.", {
   action: z.enum(["list", "open", "switch", "close"]).describe("What to do: list tabs, open a new one, switch to an existing one, or close one"),
   url: z.string().optional().describe("URL to load in the new tab (only for action='open')"),
   index: z.number().optional().describe("Tab index as shown by 'list' (required for switch/close)"),
-}, async ({ action, url, index }) => {
+  background: z.boolean().optional().default(false).describe("Only for action='open': create the tab without activating/focusing it (active tab stays unchanged)"),
+}, async ({ action, url, index, background }) => {
   try {
     return await withLock(async () => {
       syncContexts();
@@ -1154,11 +1221,7 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
         const pages = await pagesInCurrentWindow();
         const tabs = pages.map(async (p, i) => {
           let title = "";
-          try {
-            title = await p.title();
-          } catch {
-            title = "";
-          }
+          try { title = await p.title(); } catch { title = ""; }
           return `${i}: ${p.url()}${title ? ` - ${title}` : ""}${p === currentPage ? " <- active" : ""}`;
         });
         const lines = await Promise.all(tabs);
@@ -1169,6 +1232,26 @@ server.tool("tabs", "Manage tabs in the current window. Actions: list (see all t
         return text(out);
       }
       if (action === "open") {
+        if (background) {
+          if (!cdpSession) return textErr("Error: background open requires a CDP session (run connect_brave first)");
+          let bgPage = null;
+          try {
+            const { targetId } = await cdpSession.send("Target.createTarget", { url: "about:blank", newWindow: false });
+            for (let i = 0; i < 50 && !bgPage; i++) {
+              for (const p of ctx.pages()) {
+                const pinfo = await pageWindowInfo(p);
+                if (pinfo?.targetId === targetId) { bgPage = p; break; }
+              }
+              if (!bgPage) await new Promise(r => setTimeout(r, 100));
+            }
+          } catch (e) { log(`tabs open background: ${e.message}`); }
+          if (!bgPage) return textErr("Error: created background target but could not attach to it");
+          try {
+            if (url) { assertSafeUrl(url); await bgPage.goto(safeNavigateUrl(url), { waitUntil: "domcontentloaded", timeout: 30000 }); await waitForPageReady(bgPage); }
+          } catch (e) { await bgPage.close().catch(() => {}); throw e; }
+          await applyNativeColorScheme(bgPage);
+          return text(`New tab opened in background${url ? `: ${url}` : ""} (active tab unchanged)\nTitle: ${await bgPage.title()}`);
+        }
         let page = null;
         if (currentPage && cdpSession) {
           try {
@@ -1545,6 +1628,341 @@ server.tool("pdf_export", "Save the current page as a PDF (A4, with margins and 
     await page.pdf({ path: savePath, format: "A4", margin: { top: "20mm", right: "15mm", bottom: "20mm", left: "15mm" }, printBackground: true });
     return text(`PDF saved to: ${savePath}`);
   } catch (e) { return textErr(`Error exporting PDF: ${e.message}`); }
+});
+
+
+const STATIC_EXT_RE = /\.(css|js|png|jpe?g|gif|svg|woff2?|ico|map)(\?|#|$)/i;
+
+server.tool("network_start", "Start capturing HTTP requests/responses on the current tab via CDP (Fetch + Network domains). Static resources skipped unless include_static=true. Auto-stops after max_time ms.", {
+  max_time: z.number().min(1000).max(600000).optional().default(30000).describe("Auto-stop after this many ms (default 30000, max 600000)"),
+  include_static: z.boolean().optional().default(false).describe("Also capture static resources (.css/.js/.png/.jpg/.gif/.svg/.woff/.woff2/.ico/.map)"),
+}, async ({ max_time, include_static }) => {
+  try {
+    const page = requirePage();
+    if (networkCapture.active) stopNetworkCapture();
+    const session = await page.context().newCDPSession(page);
+    networkCapture.active = true; networkCapture.requests = []; networkCapture.cdpSession = session;
+    await session.send("Fetch.enable", { patterns: [{ requestStage: "Request" }] });
+    await session.send("Network.enable");
+    session.on("Fetch.requestPaused", async (event) => {
+      const { requestId, request } = event;
+      try {
+        if (!include_static && STATIC_EXT_RE.test(request.url)) { await session.send("Fetch.continueRequest", { requestId }).catch(() => {}); return; }
+        networkCapture.requests.push({ requestId, url: request.url, method: request.method, headers: request.headers || {}, postData: typeof request.postData === "string" ? request.postData : null, timestamp: Date.now() });
+        await session.send("Fetch.continueRequest", { requestId }).catch(() => {});
+      } catch {}
+    });
+    session.on("Network.responseReceived", (event) => {
+      const req = networkCapture.requests.find((r) => r.requestId === event.requestId);
+      if (req) { req.status = event.response.status; req.mimeType = event.response.mimeType; req.responseHeaders = event.response.headers || {}; req.timing = event.response.timing || null; }
+    });
+    session.on("Network.loadingFinished", async (event) => {
+      const req = networkCapture.requests.find((r) => r.requestId === event.requestId);
+      if (!req) return;
+      try { const { body } = await session.send("Network.getResponseBody", { requestId: event.requestId }); req.bodyLength = body ? body.length : 0; req.bodyPreview = body ? String(body).slice(0, 500) : ""; } catch {}
+    });
+    networkCapture.timeout = setTimeout(() => { try { const n = stopNetworkCapture().length; log(`network_start: auto-stopped after ${max_time}ms (${n} requests)`); } catch {} }, max_time);
+    return text(`Network capture started on ${page.url()} (auto-stop in ${max_time}ms). Use network_stop to collect.`);
+  } catch (e) { return textErr(`Error starting capture: ${e.message}`); }
+});
+
+server.tool("network_stop", "Stop active network capture and return all captured requests as JSON with summary.", {}, async () => {
+  try {
+    const requests = stopNetworkCapture();
+    const sb = {}; for (const r of requests) { const k = r.status != null ? String(r.status) : "pending"; sb[k] = (sb[k] || 0) + 1; }
+    return text(JSON.stringify({ total: requests.length, statusBreakdown: sb, requests }, null, 2));
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("network_list", "Peek at captured requests without stopping. Returns count and last 20 (url, method, status).", {}, async () => {
+  try {
+    requirePage();
+    const last = networkCapture.requests.slice(-20).map((r) => ({ url: r.url, method: r.method, status: r.status ?? null }));
+    return text(JSON.stringify({ active: networkCapture.active, count: networkCapture.requests.length, last20: last }, null, 2));
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("network_request", "Send a custom HTTP request through the browser (like fetch) and return full response: status, headers, body (truncated to 50000). Cookies/session apply.", {
+  url: z.string().describe("Full URL (http/https)"),
+  method: z.string().optional().default("GET").describe("HTTP method"),
+  headers: z.record(z.string()).optional().describe("Request headers object"),
+  body: z.string().optional().describe("Request body string"),
+}, async ({ url, method, headers, body }) => {
+  try {
+    assertSafeUrl(url); const safeUrl = safeNavigateUrl(url); const page = requirePage();
+    const result = await page.evaluate(async ({ url, method, headers, body }) => {
+      try {
+        const res = await fetch(url, { method, headers: headers || undefined, body: body ?? undefined, credentials: "include" });
+        let t = ""; try { t = await res.text(); } catch {}
+        return { ok: true, status: res.status, statusText: res.statusText, headers: Object.fromEntries(res.headers.entries()), body: t };
+      } catch (e) { return { ok: false, error: e?.message || String(e) }; }
+    }, { url: safeUrl, method, headers: headers || null, body: body ?? null });
+    if (!result.ok) return textErr(`Fetch failed: ${result.error}`);
+    result.body = String(result.body || "").slice(0, 50000);
+    return text(JSON.stringify(result, null, 2));
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+const F2_INTERACTIVE_ROLES = new Set(["button", "link", "textbox", "checkbox", "radio", "combobox", "menuitem", "option", "tab", "slider", "switch", "searchbox", "spinbutton", "menuitemcheckbox", "menuitemradio", "treeitem"]);
+const F2_NOISE_ROLES = new Set(["inlinetextbox", "linebreak"]);
+const F2_STATE_KEYS = ["disabled", "focused", "expanded", "selected", "checked", "pressed", "required", "invalid", "readonly", "modal", "level"];
+function f2AxValue(v) { if (v == null) return undefined; return Object.prototype.hasOwnProperty.call(v, "value") ? v.value : v; }
+async function f2BuildSelectors(cdp, backendIds) {
+  const out = new Map(); if (!backendIds.size) return out;
+  let root; try { ({ root } = await cdp.send("DOM.getDocument", { depth: -1, pierce: true })); } catch { return out; }
+  const byNodeId = new Map(); const byBackend = new Map();
+  (function visit(n) { byNodeId.set(n.nodeId, n); if (n.backendNodeId != null && !byBackend.has(n.backendNodeId)) byBackend.set(n.backendNodeId, n); for (const c of [...(n.children || []), ...(n.shadowRoots || []), ...(n.templateContents || []), ...(n.contentDocument ? [n.contentDocument] : []), ...(n.pseudoElements || [])]) visit(c); })(root);
+  const esc = (s) => String(s).replace(/([^a-zA-Z0-9_\u00A0-\uFFFF-])/g, "\\$1");
+  const pathFor = (startId) => { const parts = []; let n = byNodeId.get(startId); let hops = 0; while (n && n.nodeType === 1 && parts.length < 5 && hops++ < 64) { let s = String(n.nodeName || "").toLowerCase(); if (!s || s.startsWith("#")) break; const attrs = n.attributes || []; let idVal = null; for (let i = 0; i < attrs.length; i += 2) if (attrs[i] === "id") idVal = attrs[i + 1]; if (idVal) { parts.unshift(`#${esc(idVal)}`); break; } const parent = n.parentId != null ? byNodeId.get(n.parentId) : null; if (parent) { const sameTag = (parent.children || []).filter((c) => c.nodeType === 1 && c.nodeName === n.nodeName); if (sameTag.length > 1) s += `:nth-of-type(${sameTag.indexOf(n) + 1})`; } parts.unshift(s); n = parent; } return parts.join(" > "); };
+  for (const bid of backendIds) { const dn = byBackend.get(bid); if (!dn) continue; const sel = pathFor(dn.nodeId); if (sel) out.set(bid, sel); }
+  return out;
+}
+server.tool("read_page", "Build an accessibility tree of the current page with stable ref IDs (ref_1, ref_2, ...). Returns indented text tree + refs array with role, name, CSS selector. Use filter='interactive' for only clickable/typeable elements. Use refs with click tool's ref param.", {
+  filter: z.enum(["all", "interactive"]).optional().default("all").describe("'all' = all labeled nodes; 'interactive' = only buttons, links, fields, menus, tabs"),
+  tab_id: z.string().optional().describe("Target tab whose URL contains this substring"),
+}, async ({ filter, tab_id }) => {
+  let session = null;
+  try {
+    syncContexts(); let page;
+    if (tab_id) { const pages = contexts.flatMap((c) => c.pages()); page = pages.find((p) => p.url().includes(tab_id)); if (!page) return textErr(`No tab with URL containing "${tab_id}".`); }
+    else { page = requirePage(); }
+    session = await page.context().newCDPSession(page);
+    const { nodes } = await session.send("Accessibility.getFullAXTree");
+    const axById = new Map(nodes.map((n) => [n.nodeId, n])); const childrenOf = new Map(); const roots = [];
+    for (const n of nodes) { if (n.parentId && axById.has(n.parentId)) { if (!childrenOf.has(n.parentId)) childrenOf.set(n.parentId, []); childrenOf.get(n.parentId).push(n); } else roots.push(n); }
+    refMap.clear(); refCounter = 0;
+    const lines = []; const included = []; const byBackend = new Map(); const MAX_NODES = 3000;
+    const walk = (node, depth) => {
+      if (lines.length >= MAX_NODES) return;
+      const role = String(f2AxValue(node.role) || "").toLowerCase(); const name = String(f2AxValue(node.name) ?? "").trim(); const desc = String(f2AxValue(node.description) ?? "").trim();
+      const kids = childrenOf.get(node.nodeId) || [];
+      if (!role || node.ignored || F2_NOISE_ROLES.has(role)) { for (const k of kids) walk(k, depth); return; }
+      const states = {}; for (const p of node.properties || []) { const pn = String(p.name); if (F2_STATE_KEYS.includes(pn)) states[pn] = f2AxValue(p.value); }
+      const unlabeledGeneric = (role === "generic" || role === "none" || role === "presentation") && !name && !desc;
+      const doInclude = filter === "interactive" ? F2_INTERACTIVE_ROLES.has(role) : !unlabeledGeneric;
+      if (doInclude) {
+        refCounter += 1; const ref = `ref_${refCounter}`;
+        const entry = { ref, role, name, description: desc || undefined, states, backendDOMNodeId: node.backendDOMNodeId, selector: undefined };
+        refMap.set(ref, entry); included.push(entry);
+        if (typeof entry.backendDOMNodeId === "number") { if (!byBackend.has(entry.backendDOMNodeId)) byBackend.set(entry.backendDOMNodeId, []); byBackend.get(entry.backendDOMNodeId).push(entry); }
+        const flags = []; if (states.disabled === true) flags.push("disabled"); if (states.focused === true) flags.push("focused"); if (states.checked === true || states.checked === "mixed") flags.push(`checked=${states.checked === true ? "true" : "mixed"}`); if (states.selected === true) flags.push("selected"); if (typeof states.expanded === "boolean") flags.push(`expanded=${states.expanded}`); if (states.required === true) flags.push("required"); if (states.invalid === true) flags.push("invalid");
+        lines.push(`${"  ".repeat(Math.min(depth, 24))}[${ref}] ${role}${name ? ` "${name.slice(0, 120)}"` : ""}${flags.length ? ` [${flags.join(", ")}]` : ""}${desc ? ` — ${desc.slice(0, 100)}` : ""}`);
+      }
+      for (const k of kids) walk(k, depth + 1);
+    };
+    for (const r of roots) walk(r, 0);
+    const selectors = await f2BuildSelectors(session, new Set(byBackend.keys()));
+    for (const [bid, sel] of selectors) for (const entry of byBackend.get(bid)) entry.selector = sel;
+    const refs = included.map(({ ref, role, name, selector }) => selector ? { ref, role, name, selector } : { ref, role, name });
+    return text(JSON.stringify({ url: page.url(), title: await page.title().catch(() => ""), pageContent: lines.join("\n").slice(0, 60000), refMapCount: refMap.size, refs }, null, 2));
+  } catch (e) { return textErr(`Error reading page: ${e.message}`); }
+  finally { if (session) await session.detach().catch(() => {}); }
+});
+
+const F3_STOPWORDS = new Set(["the", "a", "an", "is", "are", "was", "were", "to", "of", "in", "for", "on", "at", "by", "with", "from", "this", "that", "it", "as", "or", "and", "not"]);
+function f3Tokenize(text) { return String(text || "").toLowerCase().split(/[^a-z]+/).filter(w => w && !F3_STOPWORDS.has(w)); }
+function f3ExtractSnippets(text, terms, maxSnippets = 3, snippetLen = 200) {
+  const sentences = String(text || "").split(/(?<=[.!?])\s+|\n+/).map(s => s.trim()).filter(Boolean);
+  const snippets = []; for (const s of sentences) { const lower = s.toLowerCase(); if (!terms.some(t => lower.includes(t))) continue; snippets.push(s.length > snippetLen ? s.slice(0, snippetLen) + "…" : s); if (snippets.length >= maxSnippets) break; } return snippets;
+}
+function simpleTfIdf(query, docs) {
+  const qTerms = f3Tokenize(query); if (!qTerms.length || !docs.length) return [];
+  const N = docs.length; const docTerms = docs.map(d => f3Tokenize(d.text));
+  const df = new Map(); for (const terms of docTerms) for (const t of new Set(terms)) df.set(t, (df.get(t) || 0) + 1);
+  const idf = (t) => Math.log((1 + N) / (1 + (df.get(t) || 0))) + 1;
+  const vectorize = (tokens) => { const tf = new Map(); for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1); const v = new Map(); let norm = 0; for (const [t, c] of tf) { const w = c * idf(t); v.set(t, w); norm += w * w; } return { v, norm: Math.sqrt(norm) }; };
+  const q = vectorize(qTerms); if (!q.norm) return [];
+  return docs.map((d, i) => { const { v, norm } = vectorize(docTerms[i]); let dot = 0; for (const [t, w] of q.v) { const dv = v.get(t); if (dv) dot += w * dv; } return { score: Math.max(0, Math.min(1, dot / (q.norm * norm))), meta: d.meta, snippets: f3ExtractSnippets(d.text, qTerms) }; }).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+}
+server.tool("search_tabs", "Search across ALL open tabs using TF-IDF cosine similarity. Extracts visible text, ranks tabs, returns top matches with URL, title, score (0-1), and matching sentence snippets.", {
+  query: z.string().describe("Search query"),
+  max_results: z.number().int().min(1).max(20).optional().default(5).describe("Max tabs to return (default 5)"),
+}, async ({ query, max_results }) => {
+  try {
+    syncContexts(); const pages = contexts.flatMap(c => { try { return c.pages(); } catch { return []; } });
+    if (!pages.length) return textErr("No open tabs. Run connect_brave first.");
+    const docs = [];
+    await Promise.all(pages.map(async (page, tabIndex) => { try { const content = await page.evaluate(extractVisibleText, { limit: 3000 }); if (content?.trim()) { const title = await page.title().catch(() => ""); docs.push({ text: content, meta: { tab_index: tabIndex, url: page.url(), title } }); } } catch {} }));
+    if (!docs.length) return textErr("Could not extract content from any tab.");
+    const ranked = simpleTfIdf(query, docs).slice(0, max_results);
+    if (!ranked.length) return text(`No tabs match "${query}".`);
+    const lines = ranked.map(r => [`Tab ${r.meta.tab_index}: ${r.meta.url}${r.meta.title ? ` - ${r.meta.title}` : ""}`, `Score: ${r.score.toFixed(3)}`, ...(r.snippets.length ? r.snippets.map(s => `> ${s}`) : ["(no snippets)"])].join("\n"));
+    return text(`Indexed ${docs.length} tab(s); top ${ranked.length} for "${query}":\n\n${lines.join("\n\n")}`);
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("computer", "Unified interaction: left/right/double/triple click, drag, scroll, type, key combos, fill, hover, wait, screenshot. Targets by CSS selector, viewport coordinates ({x,y}), or ref (ref_N) from read_page.", {
+  action: z.enum(["left_click", "right_click", "double_click", "triple_click", "left_click_drag", "scroll", "type", "key", "fill", "hover", "wait", "screenshot"]).describe("Interaction to perform"),
+  selector: z.string().optional().describe("CSS selector"),
+  text: z.string().optional().describe("Text for type/fill/key"),
+  value: z.string().optional().describe("Value for fill"),
+  coordinates: z.object({ x: z.number(), y: z.number() }).optional().describe("Target {x,y}"),
+  start_coordinates: z.object({ x: z.number(), y: z.number() }).optional().describe("Start {x,y} for drag"),
+  ref: z.string().optional().describe("ref_N from read_page"),
+  scroll_direction: z.enum(["up", "down", "left", "right"]).optional().default("down"),
+  scroll_amount: z.number().int().min(1).max(30).optional().default(3),
+  delay: z.number().min(0).max(1000).optional().default(0),
+  duration: z.number().min(0).max(30).optional().default(1),
+  key: z.string().optional().describe("Key combo, e.g. 'Control+a'"),
+}, async ({ action, selector, text: t, value, coordinates, start_coordinates, ref, scroll_direction, scroll_amount, delay, duration, key }) => {
+  try {
+    const page = requirePage();
+    const resolveLocator = () => {
+      if (ref) { const entry = refMap.get(ref); if (!entry) throw new Error(`Unknown ref '${ref}'. Call read_page first.`); return page.locator(entry.selector || entry.role).first(); }
+      if (selector) return page.locator(selector).first(); return null;
+    };
+    let out;
+    switch (action) {
+      case "left_click": case "right_click": case "double_click": case "triple_click": {
+        const btn = action === "right_click" ? "right" : "left"; const cc = action === "double_click" ? 2 : action === "triple_click" ? 3 : 1;
+        if (coordinates) { await page.mouse.move(coordinates.x, coordinates.y); await page.mouse.click(coordinates.x, coordinates.y, { button: btn, clickCount: cc }); out = `${action}: (${coordinates.x}, ${coordinates.y})`; }
+        else { const loc = resolveLocator(); if (!loc) return textErr(`${action} requires selector, ref, or coordinates`); await loc.click({ button: btn, clickCount: cc, timeout: 5000 }); out = `${action}: ${ref || selector}`; } break;
+      }
+      case "left_click_drag": {
+        if (!start_coordinates || !coordinates) return textErr("Requires start_coordinates and coordinates");
+        await page.mouse.move(start_coordinates.x, start_coordinates.y); await page.mouse.down();
+        await page.mouse.move(coordinates.x, coordinates.y, { steps: Math.max(5, Math.round((duration ?? 1) * 10)) }); await page.mouse.up();
+        out = `Dragged (${start_coordinates.x},${start_coordinates.y}) -> (${coordinates.x},${coordinates.y})`; break;
+      }
+      case "scroll": {
+        const px = 400; const dx = scroll_direction === "left" ? -px * scroll_amount : scroll_direction === "right" ? px * scroll_amount : 0; const dy = scroll_direction === "up" ? -px * scroll_amount : px * scroll_amount;
+        if (coordinates) await page.mouse.move(coordinates.x, coordinates.y); else { const loc = resolveLocator(); if (loc) await loc.hover({ timeout: 3000 }).catch(() => {}); }
+        await page.mouse.wheel(dx, dy); out = `Scrolled ${scroll_direction} ${scroll_amount} ticks`; break;
+      }
+      case "type": { if (!t) return textErr("type requires text"); const loc = resolveLocator(); if (loc) await loc.pressSequentially(t, { delay }); else await page.keyboard.type(t, { delay }); out = `Typed: ${t}`; break; }
+      case "key": { const combo = key || t; if (!combo) return textErr("key requires key"); await page.keyboard.press(combo); out = `Pressed: ${combo}`; break; }
+      case "fill": { const v = value ?? t; if (v == null) return textErr("fill requires value"); const loc = resolveLocator(); if (!loc) return textErr("fill requires selector or ref"); await loc.fill(v); out = `Filled: ${v}`; break; }
+      case "hover": { if (coordinates) { await page.mouse.move(coordinates.x, coordinates.y); out = `Hovered: (${coordinates.x},${coordinates.y})`; } else { const loc = resolveLocator(); if (!loc) return textErr("hover requires selector, ref, or coordinates"); await loc.hover({ timeout: 5000 }); out = `Hovered: ${ref || selector}`; } break; }
+      case "wait": { const secs = Math.min(Math.max(duration ?? 1, 0), 30); await page.waitForTimeout(secs * 1000); out = `Waited ${secs}s`; break; }
+      case "screenshot": { const b64 = String(await page.screenshot({ encoding: "base64" })); out = `Screenshot (${b64.length} chars):\n${b64.slice(0, 3000)}${b64.length > 3000 ? "\n...[truncated]" : ""}`; break; }
+    }
+    const cr = await autoWaitForCaptcha(); if (cr) out += `\nCAPTCHA: ${cr}`;
+    return text(out);
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("inject_script", "Inject a persistent content script into the current tab that re-runs on every navigation. Scripts run in isolated world 'mcp_injected'. Use send_to_injected to communicate.", {
+  script: z.string().describe("JavaScript code to inject"),
+  name: z.string().describe("Unique identifier for this script"),
+}, async ({ script, name }) => {
+  try {
+    const page = requirePage(); const session = await page.context().newCDPSession(page);
+    try {
+      await session.send("Page.enable"); const prev = injectedScripts.get(name);
+      if (prev?.scriptId) await session.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: prev.scriptId }).catch(() => {});
+      const { identifier } = await session.send("Page.addScriptToEvaluateOnNewDocument", { source: script, worldName: "mcp_injected", runImmediately: false });
+      const imm = await session.send("Runtime.evaluate", { expression: script, worldName: "mcp_injected", returnByValue: true }).catch(() => null);
+      if (imm?.exceptionDetails) log(`inject_script "${name}" immediate failed: ${imm.exceptionDetails.exception?.description || imm.exceptionDetails.text}`);
+      injectedScripts.set(name, { scriptId: identifier, worldName: "mcp_injected" });
+      return text(`Injected "${name}" (scriptId: ${identifier}). Persists across navigations.${imm?.exceptionDetails ? " Note: immediate eval threw (see log)." : ""}`);
+    } finally { await session.detach().catch(() => {}); }
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("send_to_injected", "Send a message to an injected script and await reply. Script should dispatch CustomEvent 'mcp-response-<name>' with detail=response. Waits 5000ms.", {
+  name: z.string().describe("Script name from inject_script"),
+  data: z.string().optional().describe("Data as event.detail"),
+}, async ({ name, data }) => {
+  try {
+    const entry = injectedScripts.get(name); if (!entry) return textErr(`No script "${name}". Run inject_script first.`);
+    const page = requirePage();
+    const expr = `(async () => new Promise((resolve) => { const R=${JSON.stringify(`mcp-response-${name}`)}; function fin(v){clearTimeout(t);window.removeEventListener(R,h);resolve(v)} function h(e){fin(e.detail===undefined?null:e.detail)} const t=setTimeout(()=>fin({__timeout:true}),5000); window.addEventListener(R,h); window.dispatchEvent(new CustomEvent(${JSON.stringify(`mcp-message-${name}`)},{detail:${JSON.stringify(data ?? null)}})); }))().catch(e=>({__error:String(e&&e.message||e)}))`;
+    const session = await page.context().newCDPSession(page);
+    try {
+      const res = await session.send("Runtime.evaluate", { expression: expr, worldName: entry.worldName || "mcp_injected", awaitPromise: true, returnByValue: true });
+      if (res.exceptionDetails) throw new Error(res.exceptionDetails.exception?.description || "eval failed");
+      const v = res.result?.value;
+      if (v?.__timeout) return textErr(`Timeout: "${name}" did not respond in 5000ms`);
+      if (v?.__error) return textErr(`"${name}" error: ${v.__error}`);
+      if (v == null) return text(`(no response from "${name}")`);
+      return text(typeof v === "string" ? v : JSON.stringify(v, null, 2));
+    } finally { await session.detach().catch(() => {}); }
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("bookmark_add", "Add a bookmark to the local store (persisted to bookmarks.json). Updates if same URL exists.", {
+  url: z.string().describe("URL to bookmark"),
+  title: z.string().describe("Display title"),
+  folder: z.string().optional().default("").describe("Optional folder name"),
+}, async ({ url, title, folder }) => {
+  try {
+    const existing = bookmarks.find((b) => b.url === url);
+    if (existing) { existing.title = title; existing.folder = folder || existing.folder || ""; saveBookmarksFile(); return text(`Updated: ${title} (${url})`); }
+    bookmarks.push({ url, title, folder: folder || "", added_at: new Date().toISOString() }); saveBookmarksFile();
+    return text(`Added: ${title} (${url})${folder ? ` in "${folder}"` : ""}\nTotal: ${bookmarks.length}`);
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("bookmark_delete", "Delete bookmark(s) by exact URL or title match (case-insensitive).", {
+  url: z.string().optional().describe("Exact URL to delete"),
+  title: z.string().optional().describe("Exact title to delete"),
+}, async ({ url, title }) => {
+  try {
+    if (!url && !title) return textErr("Provide url or title");
+    const n = (s) => String(s || "").toLowerCase(); const before = bookmarks.length;
+    bookmarks = bookmarks.filter((b) => !(url && n(b.url) === n(url)) && !(title && n(b.title) === n(title)));
+    const removed = before - bookmarks.length;
+    if (!removed) return textErr(`No match. Use bookmark_search first.`);
+    saveBookmarksFile(); return text(`Deleted ${removed}. Remaining: ${bookmarks.length}`);
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("bookmark_search", "Search bookmarks by keyword (case-insensitive title/URL match). Omit query to list all.", {
+  query: z.string().optional().default("").describe("Search keyword"),
+  max_results: z.number().int().min(1).max(500).optional().default(50),
+}, async ({ query, max_results }) => {
+  try {
+    const q = query.trim().toLowerCase();
+    const matches = bookmarks.filter((b) => !q || String(b.title || "").toLowerCase().includes(q) || String(b.url || "").toLowerCase().includes(q));
+    if (!matches.length) return text(q ? `No matches for "${query}"` : "No bookmarks saved.");
+    const shown = matches.slice(0, max_results);
+    return text(`Matches (${shown.length}${matches.length > shown.length ? ` of ${matches.length}` : ""}):\n${shown.map((b, i) => `${i}: [${b.folder || "-"}] ${b.title} -> ${b.url}`).join("\n")}`);
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("bookmark_list", "List all bookmarks. Set import_chrome=true to merge from Chrome/Brave profile first.", {
+  folder: z.string().optional().describe("Filter by folder"),
+  import_chrome: z.boolean().optional().default(false).describe("Import from Chrome/Brave Bookmarks file first"),
+}, async ({ folder, import_chrome }) => {
+  try {
+    let imported = 0;
+    if (import_chrome) {
+      const candidates = [join(os.homedir(), ".config", "BraveSoftware", "Brave-Browser", "Default", "Bookmarks"), join(os.homedir(), ".config", "google-chrome", "Default", "Bookmarks")];
+      const file = candidates.find((c) => existsSync(c));
+      if (!file) return textErr("No Chrome/Brave Bookmarks file found");
+      const parsed = JSON.parse(readFileSync(file, "utf-8")); const found = [];
+      for (const root of Object.values(parsed.roots || {})) walkChromeBookmarkFolder(root, "", found);
+      const known = new Set(bookmarks.map((b) => b.url));
+      for (const b of found) { if (known.has(b.url)) continue; bookmarks.push({ url: b.url, title: b.title, folder: b.folder, added_at: new Date().toISOString() }); known.add(b.url); imported++; }
+      if (imported) saveBookmarksFile();
+    }
+    const f = folder ? String(folder).toLowerCase() : null;
+    const matches = bookmarks.filter((b) => !f || String(b.folder || "").toLowerCase() === f);
+    if (!matches.length) return text(`${imported ? `Imported ${imported}. ` : ""}No bookmarks${f ? ` in "${folder}"` : ""}.`);
+    return text(`${imported ? `Imported ${imported}. ` : ""}All (${matches.length}):\n${matches.map((b, i) => `${i}: [${b.folder || "-"}] ${b.title} -> ${b.url}`).join("\n")}`);
+  } catch (e) { return textErr(`Error: ${e.message}`); }
+});
+
+server.tool("history_search", "Search browsing history recorded by navigate calls (persisted in history.json). Matches URL/title case-insensitively. Most recent first.", {
+  query: z.string().optional().default("").describe("Keyword to match"),
+  start_time: z.string().optional().describe("ISO timestamp; only after this"),
+  end_time: z.string().optional().describe("ISO timestamp; only before this"),
+  max_results: z.number().int().min(1).max(1000).optional().default(100),
+}, async ({ query, start_time, end_time, max_results }) => {
+  try {
+    let startMs = null, endMs = null;
+    if (start_time) { const t = Date.parse(start_time); if (Number.isNaN(t)) return textErr(`Invalid start_time`); startMs = t; }
+    if (end_time) { const t = Date.parse(end_time); if (Number.isNaN(t)) return textErr(`Invalid end_time`); endMs = t; }
+    const q = query.trim().toLowerCase();
+    const matches = browsingHistory.filter((h) => {
+      if (q && !String(h.url || "").toLowerCase().includes(q) && !String(h.title || "").toLowerCase().includes(q)) return false;
+      const ts = Date.parse(h.timestamp); if (startMs !== null && !(Number.isNaN(ts) ? false : ts >= startMs)) return false;
+      if (endMs !== null && !(Number.isNaN(ts) ? false : ts <= endMs)) return false; return true;
+    }).reverse();
+    if (!matches.length) return text(q || start_time || end_time ? `No history matching "${query}"` : "History empty. Navigate somewhere first.");
+    const shown = matches.slice(0, max_results);
+    return text(`History (${shown.length}${matches.length > shown.length ? ` of ${matches.length}` : ""}):\n${shown.map((h, i) => `${i}: [${h.timestamp}] ${h.title || "(no title)"} -> ${h.url}`).join("\n")}`);
+  } catch (e) { return textErr(`Error: ${e.message}`); }
 });
 
 server.tool("health", "Check that the server is running and whether the browser is connected. Returns server version, connection state, open window/tab counts, and the active tab's URL and title.", {}, async () => {
