@@ -1149,30 +1149,6 @@ async function replayInjectedOnTab(tabId) {
 // These are serialized into the page by executeScript; they MUST NOT close
 // over module scope. Everything arrives via `args`.
 
-/** Compile + run `source` (arrow/function expression preferred, statements ok).
- *  Statement bodies access their arguments via the rest array `__argv`. */
-function __mcpEval(source, callArgs) {
-  const argv = Array.isArray(callArgs) ? callArgs : [];
-  let fn;
-  try {
-    fn = new Function(`"use strict"; return (${source});`)();
-  } catch {
-    fn = undefined;
-  }
-  if (typeof fn !== "function") {
-    fn = new Function(`"use strict"; return (function (...__argv) {\n${source}\n});`)();
-  }
-  return Promise.resolve()
-    .then(() => fn.apply(null, argv))
-    .then(
-      (v) => {
-        try { return JSON.parse(JSON.stringify(v === undefined ? null : v)); }
-        catch { return String(v); }
-      },
-      (e) => ({ __mcpError: String((e && e.message) || e) }),
-    );
-}
-
 /** Dispatch CustomEvent `mcp-inject:<name>` and await the reply event carrying
  *  our nonce. Contract for injected.js:
  *    addEventListener(`mcp-inject:${name}`, (ev) => {
@@ -1323,15 +1299,26 @@ const ok = (result) => ({ ok: true, result });
 async function hBrowserState(args) {
   const wins = await cbp(chrome.windows.getAll.bind(chrome.windows), {}).catch((e) => { throw mapChromeError(e); });
   const tabs = await cbp(chrome.tabs.query.bind(chrome.tabs), {}).catch((e) => { throw mapChromeError(e); });
-  const activeWindowId = browserState.lastFocusedWindowId;
+  // Always query fresh active tab info instead of relying on cached state
   let activeTabId = browserState.currentTabId;
-  if (activeWindowId != null) {
-    const act = await cbp(chrome.tabs.query.bind(chrome.tabs), { windowId: activeWindowId, active: true }).catch(() => []);
-    if (act && act[0]) {
-      activeTabId = act[0].id;
-      browserState.activeTabByWindow.set(activeWindowId, act[0].id);
-      browserState.currentTabId = act[0].id;
+  let activeWindowId = browserState.lastFocusedWindowId;
+  try {
+    const fw = await cbp(chrome.windows.getLastFocused.bind(chrome.windows), { populate: false });
+    if (fw && fw.id) {
+      activeWindowId = fw.id;
+      browserState.lastFocusedWindowId = fw.id;
+      const act = await cbp(chrome.tabs.query.bind(chrome.tabs), { windowId: fw.id, active: true });
+      if (act && act[0]) {
+        activeTabId = act[0].id;
+        browserState.activeTabByWindow.set(fw.id, act[0].id);
+        browserState.currentTabId = act[0].id;
+      }
     }
+  } catch {}
+  // Fallback: if still no active tab, use first tab from first window
+  if (activeTabId == null && tabs.length > 0) {
+    activeTabId = tabs[0].id;
+    browserState.currentTabId = tabs[0].id;
   }
   return ok({
     windowCount: wins.length,
@@ -1447,13 +1434,27 @@ async function hCsEval(args) {
   if (!source) throw rpcErr(ERR.BAD_REQUEST, 'cs.eval requires "func" (function/arrow source string)');
   const tab = await getTabOrThrow(tabId);
   assertInjectableTab(tab);
-  const world = args && args.world === "MAIN" ? "MAIN" : "ISOLATED";
-  const callArgs = Array.isArray(args.args) ? args.args : [];
+  const world = "MAIN"; // Must use MAIN world — MV3 default CSP blocks new Function() in ISOLATED
+  const callArgs = JSON.stringify(Array.isArray(args.args) ? args.args : []);
   const allFrames = !!(args && args.allFrames);
+
+  // Minimal eval function — Chrome handles async natively via executeScript.
+  // No wrapping, no try/catch inside: errors propagate as script errors.
+  const evalFn = (src, argsJson) => {
+    const argv = JSON.parse(argsJson);
+    let fn;
+    try { fn = new Function('return (' + src + ')')(); } catch { fn = undefined; }
+    if (typeof fn !== 'function') {
+      try { fn = new Function('return (function (...a) { ' + src + ' })')(); }
+      catch (e) { return { __mcpError: String(e).slice(0, 200) }; }
+    }
+    return fn.apply(null, argv);
+  };
+
   const results = await chrome.scripting.executeScript({
     target: { tabId, allFrames },
     world,
-    func: __mcpEval,
+    func: evalFn,
     args: [source, callArgs],
   }).catch((e) => { throw mapChromeError(e); });
 

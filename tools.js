@@ -569,7 +569,24 @@ export function registerTools(server, ctx) {
     }
   };
 
-  const tab = (id) => (id != null ? id : bridge.requireTab());
+  const tab = (id) => {
+    if (id != null) return id;
+    if (bridge.currentTabId != null) return bridge.currentTabId;
+    throw new Error("Not connected. Run connect_brave first.");
+  };
+
+  // Helper to ensure we have a tab, with auto-recovery
+  async function ensureTab() {
+    if (bridge.currentTabId != null) return bridge.currentTabId;
+    try {
+      const state = await bridge.browser.state();
+      if (state?.activeTabId != null) {
+        bridge.setCurrentTab(state.activeTabId, state?.activeWindowId);
+        return state.activeTabId;
+      }
+    } catch {}
+    throw new Error("Not connected. Run connect_brave first.");
+  }
 
   const val = (res) => {
     const v = res && typeof res === "object" && "value" in res ? res.value : res;
@@ -756,15 +773,29 @@ export function registerTools(server, ctx) {
     background: z.boolean().default(false),
   }, guard(async ({ url, wait_until, timeout_ms, tab_id, background }) => {
     assertSafeUrl(url);
-    if (background && tab_id == null) {
+    // Resolve tab_id: explicit > currentTabId > active tab from extension
+    let resolvedTabId = tab_id;
+    if (resolvedTabId == null) {
+      resolvedTabId = bridge.currentTabId;
+      if (resolvedTabId == null) {
+        // Try to get active tab from extension
+        try {
+          const state = await bridge.browser.state();
+          resolvedTabId = state?.activeTabId;
+          if (resolvedTabId != null) bridge.setCurrentTab(resolvedTabId, state?.activeWindowId);
+        } catch {}
+      }
+    }
+    if (resolvedTabId == null) throw new Error("Not connected. Run connect_brave first.");
+    if (background) {
       const opened = await bridge.tabs.open(url, { active: false });
       addHistoryEntry({ url, title: opened?.title || url, tabId: opened?.tabId ?? null });
       return json({ ok: true, openedInBackground: true, ...opened });
     }
     const result = await bridge.nav.goto(url, {
-      tabId: tab_id, waitUntil: wait_until, timeoutMs: timeout_ms,
+      tabId: resolvedTabId, waitUntil: wait_until, timeoutMs: timeout_ms,
     });
-    addHistoryEntry({ url, title: result?.title || url, tabId: tab_id ?? bridge.currentTabId });
+    addHistoryEntry({ url, title: result?.title || url, tabId: resolvedTabId });
     return json(result);
   }));
 
@@ -773,7 +804,7 @@ export function registerTools(server, ctx) {
     direction: z.enum(["back", "forward"]).default("back"),
     steps: z.number().int().min(1).max(50).default(1),
   }, guard(async ({ direction, steps }) => {
-    const tabId = bridge.requireTab();
+    const tabId = await ensureTab();
     const delta = direction === "back" ? -steps : steps;
     const result = await evalV(tabId,
       "(d) => { history.go(d); return new Promise((res) => setTimeout(() => res({ url: location.href, title: document.title }), 400)); }",
@@ -863,7 +894,7 @@ export function registerTools(server, ctx) {
     limit: z.number().int().min(100).max(200000).default(10000),
     selector: z.string().optional(),
   }, guard(async ({ format, limit, selector }) => {
-    const tabId = tab();
+    const tabId = await ensureTab();
     if (format === "html") {
       const res = await evalV(tabId, pageExtractHTML, [selector ?? null]);
       return json({
@@ -885,7 +916,7 @@ export function registerTools(server, ctx) {
     filter: z.enum(["interactive", "all"]).default("interactive"),
     max_refs: z.number().int().min(10).max(1000).default(150),
   }, guard(async ({ filter, max_refs }) => {
-    const tabId = tab();
+    const tabId = await ensureTab();
 
     const tree = await bridge.dbg.command(tabId, "Accessibility.getFullAXTree", {});
     const nodes = Array.isArray(tree?.nodes) ? tree.nodes : [];
@@ -989,12 +1020,12 @@ export function registerTools(server, ctx) {
 
   // 13. list_elements
   server.tool("list_elements", "List elements of a kind (links, buttons, inputs...) with names and reusable selectors", {
-    kind: z.enum(["link", "button", "input", "select", "textarea", "image", "heading"]),
+    kind: z.enum(["all", "link", "button", "input", "select", "textarea", "image", "heading"]),
     contains: z.string().optional(),
     scope: z.string().optional(),
     limit: z.number().int().min(1).max(500).default(50),
   }, guard(async ({ kind, contains, scope, limit }) => {
-    const tabId = tab();
+    const tabId = await ensureTab();
     let elements;
     let pageTitle;
     let pageUrl;
@@ -1011,6 +1042,7 @@ export function registerTools(server, ctx) {
       pageTitle = res.title;
       pageUrl = res.url;
       const KIND_PREDICATE = {
+        all: () => true,
         link: (e) => e.tag === "a" || e.role === "link",
         button: (e) => e.tag === "button" || e.role === "button"
           || (e.tag === "input" && ["submit", "button", "reset"].includes(e.type)),
@@ -1018,7 +1050,7 @@ export function registerTools(server, ctx) {
         select: (e) => e.tag === "select" || e.role === "combobox",
         textarea: (e) => e.tag === "textarea",
       };
-      elements = res.elements.filter(KIND_PREDICATE[kind]);
+      elements = res.elements.filter(KIND_PREDICATE[kind] || (() => true));
     }
 
     const needle = contains ? contains.trim().toLowerCase() : null;
@@ -1220,7 +1252,7 @@ export function registerTools(server, ctx) {
     action: z.enum(["play", "pause", "toggle", "mute", "unmute", "seek", "set_speed", "set_volume", "fullscreen", "exit_fullscreen", "get_info"]),
     value: z.union([z.number(), z.string()]).optional(),
   }, guard(async ({ action, value }) => {
-    const tabId = tab();
+    const tabId = await ensureTab();
     const BRIDGE_ACTIONS = new Set(["play", "pause", "toggle", "mute", "unmute"]);
     if (BRIDGE_ACTIONS.has(action)) {
       return json(await bridge.dom.videoControl(tabId, action, null));
@@ -1532,7 +1564,7 @@ export function registerTools(server, ctx) {
     scroll_amount: z.number().int().min(1).max(100000).default(800),
     delay: z.number().int().min(0).max(120000).default(0),
   }, guard(async (a) => {
-    const tabId = bridge.requireTab();
+    const tabId = await ensureTab();
     switch (a.action) {
       case "click":
       case "double_click":
