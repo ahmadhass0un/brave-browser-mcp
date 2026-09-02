@@ -875,7 +875,7 @@ export function registerTools(server, ctx) {
   // -------------------------------------------------------------------------
 
   // 1. connect_brave
-  server.tool("connect_brave", "Connect to the browser via the extension and report its state", {},
+  server.tool("connect_brave", "FIRST CALL: establish WebSocket to the Brave extension (ws://127.0.0.1:9224) and return live browser state. Call before any tab/page tools. No args. Returns windowCount, tabCount, activeTabId, activeWindowId, transport, sessionId, and next_step hint (run read_page). Retries automatically if extension not yet ready.", {},
     guard(async () => {
       const state = await bridge.browser.state();
       bridge.drainRecentEvents(); // stale events from a previous session are noise
@@ -893,14 +893,14 @@ export function registerTools(server, ctx) {
     }));
 
   // 2. disconnect
-  server.tool("disconnect", "Drop the connection to the browser (the browser itself keeps running)", {},
+  server.tool("disconnect", "Disconnect the MCP transport (extension stays connected to browser). Use to reset pending calls, clear refMap, and force next call to re-handshake. No args. Returns ok. Browser tabs remain open.", {},
     guard(async () => {
       bridge.shutdown();
       return json({ ok: true, disconnected: true });
     }));
 
   // 3. navigate — P0.2 adds width/height viewport passthrough (keep BN perf, no extra hops)
-  server.tool("navigate", "Navigate a tab to a URL and wait for it to settle", {
+  server.tool("navigate", "Navigate a tab to a URL and wait until it settles. Requires connect_brave first. Args: url (https:// only, SSRF-blocked), wait_until (commit|domcontentloaded|load|networkidle, default load), timeout_ms 1s-120s, tab_id optional (defaults to active tab), background (true opens new background tab), width/height (viewport resize 100-8000). Returns tabId/url/title/status/elapsedMs. Auto-saves to history.", {
     url: z.string().url(),
     wait_until: z.enum(["commit", "domcontentloaded", "load", "networkidle"]).default("load"),
     timeout_ms: z.number().int().min(1000).max(120000).default(30000),
@@ -940,7 +940,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 4. navigate_history
-  server.tool("navigate_history", "Go back or forward in the active tab's session history", {
+  server.tool("navigate_history", "Navigate session history like browser Back/Forward. Requires active tab. Args: direction (back|forward, default back), steps 1-50. Uses history.go() then 400ms settle. Returns new url/title. Saved to history.", {
     direction: z.enum(["back", "forward"]).default("back"),
     steps: z.number().int().min(1).max(50).default(1),
   }, guard(async ({ direction, steps }) => {
@@ -954,7 +954,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 5. click
-  server.tool("click", "Click an element by selector, visible text, or ref_N from read_page (trusted CDP click with DOM fallback)", {
+  server.tool("click", "Click an element — trusted CDP dispatchMouseEvent with DOM fallback. Use after read_page for ref_N or directly via CSS selector. Args: selector (CSS), by_text (exact visible text), ref (ref_3 from read_page), scope (parent selector), button (left|right|middle), double_click (bool), trusted (true uses CDP isTrusted). Returns mode (cdp-trusted|content|dom-fallback), jsClicked, interceptedBy. For file inputs use type instead.", {
     selector: z.string().optional(),
     double_click: z.boolean().default(false),
     button: z.enum(["left", "right", "middle"]).default("left"),
@@ -971,7 +971,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 6. type
-  server.tool("type", "Type text into an input/textarea/contenteditable (optionally char-by-char)", {
+  server.tool("type", "Type/fill text into an input, textarea, or contenteditable. Prefers CSP-safe content.js then CDP. Args: selector or ref/scope, text (required), delay (initial ms 0-60000), delay_per_char (0-1000 for human-like typing), scope. Handles checkbox/radio via checked, select via option matching. Dispatches input/change. Returns filled length/tag.", {
     selector: z.string().optional(),
     text: z.string(),
     delay: z.number().int().min(0).max(60000).default(0),
@@ -986,7 +986,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 7. focus_element
-  server.tool("focus_element", "Move keyboard focus to an element (needed before press_key on custom widgets)", {
+  server.tool("focus_element", "Focus an element so subsequent press_key goes to the right target. Args: selector or by_text + scope. Uses el.focus() with click fallback. Returns focused bool, tag, activeElement check. Call before press_key on custom widgets/editors.", {
     selector: z.string().optional(),
     by_text: z.string().optional(),
     scope: z.string().optional(),
@@ -997,7 +997,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 8. press_key
-  server.tool("press_key", 'Send keyboard keys ("Enter", "Control+a"); repeats the sequence `times` times', {
+  server.tool("press_key", 'Send keyboard shortcut/keys to the focused element (or selector). Args: key (e.g. "Enter", "Tab", "Escape", "Control+a", "Shift+Tab", "Meta+c"), times 1-100 repeats, selector optional (will focus first). Supports modifiers Control/Ctrl, Alt, Shift, Meta/Cmd. Returns pressed count. For typing text, prefer type."', {
     key: z.string(),
     times: z.number().int().min(1).max(100).default(1),
     selector: z.string().optional(),
@@ -1006,7 +1006,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 9. scroll
-  server.tool("scroll", "Scroll the page or an element (use down repeatedly for infinite scroll)", {
+  server.tool("scroll", "Scroll page or scrollable element. Args: direction (up|down|left|right, default down), amount 1-100000px (default 800), selector optional (element selector to scroll inside). Returns before/after scrollX/Y. Call repeatedly for infinite scroll / lazy-load pages.", {
     direction: z.enum(["up", "down", "left", "right"]).default("down"),
     amount: z.number().int().min(1).max(100000).default(800),
     selector: z.string().optional(),
@@ -1015,7 +1015,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 10. get_page_info (CSP-safe: content.js first)
-  server.tool("get_page_info", "Get the current page's URL, title, loading status, scroll state, interactivity, and CAPTCHA presence", {
+  server.tool("get_page_info", "Quick page snapshot: URL, title, readyState, viewport, scroll, referrer, interactiveCount, and captcha detection (recaptcha/hcaptcha/turnstile). Tries content.js first (CSP-safe), falls back to eval. Optional tab_id. Use to verify navigation succeeded or check for bot challenge before acting.", {
     tab_id: z.number().int().optional(),
   }, guard(async ({ tab_id }) => {
     const tabId = tab(tab_id);
@@ -1031,7 +1031,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 11. get_page_content
-  server.tool("get_page_content", "Extract readable text or raw HTML from the page or an element", {
+  server.tool("get_page_content", "Extract page content as clean text or raw HTML. Args: format (text|html, default text), limit 100-200000 chars, selector optional (null = whole page, prefers <main>). Text uses TreeWalker+visibility filter (excludes nav/aside). HTML is outerHTML truncated. Returns url/title/content/truncated flag.", {
     format: z.enum(["text", "html"]).default("text"),
     limit: z.number().int().min(100).max(200000).default(10000),
     selector: z.string().optional(),
@@ -1066,7 +1066,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 12. read_page
-  server.tool("read_page", "Build an accessibility snapshot of the page with stable ref_N ids for click/type targeting", {
+  server.tool("read_page", "Core discovery: build AXTree snapshot + DOM candidates → stable ref_N ids for AI targeting. Requires connect_brave. Args: filter (interactive|all, default interactive), max_refs 10-1000. Clears old refs, returns url/title, refCount, omitted, refs[{ref,role,name,selector,href}], and summary lines like \"ref_3 button \"Submit\"\". Pass ref to click/type/hover/wait_for. Call after each navigation.", {
     filter: z.enum(["interactive", "all"]).default("interactive"),
     max_refs: z.number().int().min(10).max(1000).default(150),
   }, guard(async ({ filter, max_refs }) => {
@@ -1185,7 +1185,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 13. list_elements
-  server.tool("list_elements", "List elements of a kind (links, buttons, inputs...) with names and reusable selectors", {
+  server.tool("list_elements", "List elements by kind with reusable selectors. Args: kind (all|link|button|input|select|textarea|image|heading), contains (substring filter on name/href), scope (parent CSS), limit 1-500. Tries content.js listInteractive then bridge fallback. Returns elements[{tag,role,name,href,selector}]. Use to find specific links/buttons without full AX snapshot.", {
     kind: z.enum(["all", "link", "button", "input", "select", "textarea", "image", "heading"]),
     contains: z.string().optional(),
     scope: z.string().optional(),
@@ -1251,7 +1251,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 14. inspect_dom
-  server.tool("inspect_dom", "Inspect an element's tag, attributes, css path, subtree, and (optionally) HTML", {
+  server.tool("inspect_dom", "Deep inspect single element: tag, id, classes, attributes (truncated), cssPath, rect, visible, child subtree, optional HTML. Args: selector or by_text + scope, max_depth 1-10, include_html bool. Resolves by_text → selector first. Returns tree + html. Use to debug selector or inspect hidden attributes.", {
     selector: z.string().optional(),
     by_text: z.string().optional(),
     scope: z.string().optional(),
@@ -1268,7 +1268,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 15. screenshot
-  server.tool("screenshot", "Capture a PNG of the page (full page) or one element; saved under data/screenshots", {
+  server.tool("screenshot", "Screenshot to PNG via CDP Page.captureScreenshot. Args: full_page bool, selector optional (clip to element rect, viewport-relative), save_path optional (inside data/screenshots, traversal-blocked). Writes 0o600. Returns savedTo path, bytes, clippedTo. If selector has zero size, throws.", {
     full_page: z.boolean().default(false),
     selector: z.string().optional(),
     save_path: z.string().optional(),
@@ -1277,14 +1277,14 @@ export function registerTools(server, ctx) {
   }));
 
   // 16. pdf_export
-  server.tool("pdf_export", "Save the current page as PDF (A4, backgrounds on); saved under data/screenshots", {
+  server.tool("pdf_export", "Save page as PDF via CDP Page.printToPDF (A4, printBackground:true, preferCSSPageSize). Args: save_path optional. Writes 0o600. Returns savedTo, bytes. Use for archiving or offline analysis.", {
     save_path: z.string().optional(),
   }, guard(async ({ save_path }) => {
     return json(await exportPdf(tab(), { savePath: save_path }));
   }));
 
   // 17. execute_js
-  server.tool("execute_js", "Run JavaScript in the page and return its result. Use `return` for a value; secrets in output are redacted unless redact=false. DANGER: requires confirm=true", {
+  server.tool("execute_js", "Execute arbitrary JavaScript in page ISOLATED world and return JSON result. DANGER — requires confirm=true. Args: code string max 20000 (wrap with return for value, or async () => ... auto-detected), confirm bool must be true, redact bool (default true hides passwords/tokens), tab_id optional. Returns stringified result. Bypasses page CSP. Use for custom DOM queries or site-specific hacks.", {
     code: z.string().max(20000),
     confirm: z.boolean().default(false),
     redact: z.boolean().default(true),
@@ -1302,7 +1302,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 18. inject_script
-  server.tool("inject_script", "Register a named persistent script that replays on every navigation", {
+  server.tool("inject_script", "Register persistent MAIN-world script that auto-replays on every navigation (survives reloads). Args: name [A-Za-z0-9_-]{1,64}, code string max 20000 (runs via indirect eval in page global), run_now bool (replay immediately). Stored in chrome.storage.session. Use to install helpers, monkey-patches, or event hooks. Returns registered total + replayNow result.", {
     name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
     code: z.string().max(20000),
     run_now: z.boolean().default(true),
@@ -1315,7 +1315,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 19. send_to_injected
-  server.tool("send_to_injected", "Send JSON data to an injected script and await its reply", {
+  server.tool("send_to_injected", "Message a registered injected script and await its reply (CustomEvent mcp-inject:<name> → reply). Args: name, data (any JSON-serializable), timeout_ms 500-60000. Ensures runtime, dispatches with nonce, waits for replyEvent. Use for bidirectional JS communication. Returns {name, data: reply detail} or INJECTED_TIMEOUT.", {
     name: z.string(),
     data: z.unknown().optional(),
     timeout_ms: z.number().int().min(500).max(60000).default(5000),
@@ -1324,7 +1324,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 20. wait_for
-  server.tool("wait_for", "Poll the DOM until a CSS selector or visible text appears (or timeout)", {
+  server.tool("wait_for", "Wait for element to appear (MutationObserver, no polling). Args: selector or text or ref (ref_N from read_page), interval_ms 100-5000 (ignored, kept for compat), timeout_ms 500-120000. Returns found bool, elapsedMs, or TIMEOUT error. Use before clicking dynamically loaded content. Note: text must be leaf-node exact-ish.", {
     selector: z.string().optional(),
     text: z.string().optional(),
     ref: z.string().optional(),
@@ -1343,7 +1343,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 21. wait_for_load
-  server.tool("wait_for_load", "Wait for the page to reach a load state", {
+  server.tool("wait_for_load", "Wait for tab load state via background waitTabSettled (tabs.onUpdated + readyState). Args: until (commit|domcontentloaded|load|networkidle, default load), timeout_ms 1s-300s. Returns tabId/url/status/title. Use after navigate or for SPA transitions.", {
     until: z.enum(["commit", "domcontentloaded", "load", "networkidle"]).default("load"),
     timeout_ms: z.number().int().min(1000).max(300000).default(30000),
   }, guard(async ({ until, timeout_ms }) => {
@@ -1351,7 +1351,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 22. tabs
-  server.tool("tabs", "List, open, switch, close, or inspect tabs", {
+  server.tool("tabs", "Manage tabs: list (all or by windowId), open (url required, active/background + windowId/index), switch (tab_id), close (tab_id), info (tab_id). Auto-validates URL (SSRF-blocked). Open/switch updates bridge currentTabId. Returns tab info (id,windowId,url,title,status,active). Use list before switch/navigate to pick right tab.", {
     action: z.enum(["list", "open", "switch", "close", "info"]),
     url: z.string().url().optional(),
     tab_id: z.number().int().optional(),
@@ -1397,7 +1397,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 23. windows
-  server.tool("windows", "List browser windows, focus one, or close one", {
+  server.tool("windows", "Manage windows: list (populated tabs), focus (window_id), close (window_id). Returns windows[{id,focused,type,state,tabs}]. Use to switch focus before tab ops or to detect popups.", {
     action: z.enum(["list", "focus", "close"]).default("list"),
     window_id: z.number().int().optional(),
   }, guard(async ({ action, window_id }) => {
@@ -1419,7 +1419,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 24. detect_captcha
-  server.tool("detect_captcha", "Check whether the current page shows a CAPTCHA (recaptcha/hcaptcha/turnstile/geetest/funcaptcha)", {},
+  server.tool("detect_captcha", "Detect CAPTCHA presence via selector checks (no heavy outerHTML). Returns detected bool, kind (recaptcha|hcaptcha|turnstile|geetest|funcaptcha|unknown), signals, frameCount. Quick CSP-friendly version of content.js detect. Check before automated form submit.", {},
     guard(async () => {
       const res = await bridge.dom.detectCaptcha(tab());
       return json(res.detected
@@ -1428,14 +1428,14 @@ export function registerTools(server, ctx) {
     }));
 
   // 25. wait_for_captcha
-  server.tool("wait_for_captcha", "Wait up to timeout_ms for the user to solve the page's CAPTCHA", {
+  server.tool("wait_for_captcha", "Block until human solves CAPTCHA: polls window.__mcpCaptcha + mcp:captcha-solved event in 8s slices. Args: timeout_ms 1s-180s. Returns solved bool, kind, alreadyClear, elapsedMs, or CAPTCHA_WAIT_TIMEOUT. Requires user interaction — notify user to solve.", {
     timeout_ms: z.number().int().min(1000).max(180000).default(60000),
   }, guard(async ({ timeout_ms }) => {
     return json(await bridge.captcha.wait({ timeoutMs: timeout_ms }));
   }));
 
   // 26. video_control
-  server.tool("video_control", "Control HTML5 video/audio playback: play, pause, toggle, mute, unmute, seek, set_speed, set_volume, fullscreen, exit_fullscreen, get_info", {
+  server.tool("video_control", "Control largest visible <video>/<audio> on page. Args: action (play|pause|toggle|mute|unmute|seek|set_speed|set_volume|fullscreen|exit_fullscreen|get_info), value (seconds for seek 0-duration, 0-1 for volume, playbackRate for speed). Returns state {currentTime,duration,paused,muted,volume,playbackRate}. Note: seek clamps, play may fail if autoplay blocked.", {
     action: z.enum(["play", "pause", "toggle", "mute", "unmute", "seek", "set_speed", "set_volume", "fullscreen", "exit_fullscreen", "get_info"]),
     value: z.union([z.number(), z.string()]).optional(),
   }, guard(async ({ action, value }) => {
@@ -1465,7 +1465,7 @@ export function registerTools(server, ctx) {
     stackoverflow: (q) => `https://stackoverflow.com/search?q=${q}`,
     wikipedia: (q) => `https://en.wikipedia.org/w/index.php?search=${q}`,
   };
-  server.tool("search", "Run a web search in the active tab and return the top results", {
+  server.tool("search", "Search the web via the active tab (navigates there). Args: query 1-500 chars (required), platform (google|bing|duckduckgo|brave|youtube|reddit|github|stackoverflow|wikipedia), region optional (country code), limit 1-50. Encodes region, uses platform-specific SERP selectors (not hard-coded X selector), waits 2s sentinel. Returns results[{title,url,snippet}], serpTitle/Url, count. Auto-saves to history.", {
     query: z.string().min(1).max(500),
     platform: z.enum(["google", "bing", "duckduckgo", "brave", "youtube", "reddit", "github", "stackoverflow", "wikipedia"]).default("google"),
     region: z.string().optional(),
@@ -1486,7 +1486,7 @@ export function registerTools(server, ctx) {
 
   // 28. search_tabs — F.3: idf WeakMap cache 5s TTL (avoid 2-5ms per query for 50 tabs)
   let _idfCache = { docsKey: null, idf: null, ts: 0 };
-  server.tool("search_tabs", "Search across all open tabs by title or URL (TF-IDF ranked)", {
+  server.tool("search_tabs", "Semantic search across open tabs by title+URL (TF-IDF + substring boost). Args: query string (tokenized, stopwords removed), limit 1-100. Caches idf 5s. Returns ranked [{id,windowId,active,title,url,score}] or \"No open tabs matching\". Use to find right tab instead of manually listing.", {
     query: z.string(),
     limit: z.number().int().min(1).max(100).default(20),
   }, guard(async ({ query, limit }) => {
@@ -1536,7 +1536,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 29. network_start
-  server.tool("network_start", "Start capturing HTTP traffic on the active tab via CDP", {
+  server.tool("network_start", "Start CDP network capture (Network+Fetch). Args: max_time 1s-600s, include_static bool (default false filters css/js/img). Holds debugger ref for window. Returns capturing, tabId, startedAt. Call network_list/peek or network_stop to get results. Supersedes previous capture.", {
     max_time: z.number().int().min(1000).max(600000).default(30000),
     include_static: z.boolean().default(false),
   }, guard(async ({ max_time, include_static }) => {
@@ -1544,17 +1544,17 @@ export function registerTools(server, ctx) {
   }));
 
   // 30. network_stop
-  server.tool("network_stop", "Stop network capture and return everything captured so far", {}, guard(async () => {
+  server.tool("network_stop", "Stop network capture, disable Fetch/Network, release debugger, sort by ts. Returns capturing:false, count, requests[{requestId,url,method,status,mimeType,resourceType,fromCache,state,bodyPreview,truncated}]. Compare before/after to find API calls.", {}, guard(async () => {
     return json(await bridge.net.stop());
   }));
 
   // 31. network_list
-  server.tool("network_list", "Peek at captured requests without stopping capture", {}, guard(async () => {
+  server.tool("network_list", "Peek snapshot of ongoing capture without stopping (last 20). Returns capturing, count, requests tail. Use for live debugging while page loads. Empty if no capture started.", {}, guard(async () => {
     return json(await bridge.net.peek());
   }));
 
   // 32. network_request
-  server.tool("network_request", "Send an HTTP request through the browser profile (cookies/session apply)", {
+  server.tool("network_request", "Fetch via browser profile (credentials:include, rides cookies). Args: url (https only, SSRF-blocked, no data:), method GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS, headers record<string> (Host/content-length blocked, \r\n rejected), body string max 200k, timeout_ms 1s-300s. Handles redirects manually (5 hops, re-validates). Streams body cap 200k. Returns status/statusText/ok/url/headers/body/truncated.", {
     url: z.string().url(),
     method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]).default("GET"),
     headers: z.record(z.string().max(512)).optional(),
@@ -1571,7 +1571,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 33. handle_dialog — P0.2 ported from mcp-chrome MIT dialog.ts
-  server.tool("handle_dialog", "Accept or dismiss a JavaScript dialog (alert/confirm/prompt) via CDP Page.handleJavaScriptDialog", {
+  server.tool("handle_dialog", "Handle JavaScript dialog (alert/confirm/prompt). Args: action (accept|dismiss), promptText optional (for prompt), tab_id optional (active tab). Uses CDP Page.enable + handleJavaScriptDialog with debugger ref. Returns handled, action. Throws if no dialog is open.", {
     action: z.enum(["accept", "dismiss"]),
     promptText: z.string().optional(),
     tab_id: z.number().int().optional(),
@@ -1580,7 +1580,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 34. handle_download — P0.2 ported from mcp-chrome MIT download.ts (polls chrome.downloads)
-  server.tool("handle_download", "Wait for a download to complete (optionally filter by filenameContains)", {
+  server.tool("handle_download", "Poll chrome.downloads until file completes. Args: filenameContains substring (matches basename or url), timeout_ms 1s-300s. Polls 500ms, checks state complete vs interrupted. Returns found, id, filename, url, fileSize. Requires downloads permission.", {
     filenameContains: z.string().optional(),
     timeout_ms: z.number().int().min(1000).max(300000).default(60000),
   }, guard(async ({ filenameContains, timeout_ms }) => {
@@ -1588,7 +1588,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 35. cookies
-  server.tool("cookies", "Get cookies (filter by domain/name), set cookies, delete/clear (auto-backup first), export/import encrypted snapshots", {
+  server.tool("cookies", "Cookie manager (AES-256-GCM encrypted snapshots). Args: action (get|set|delete|clear|export|import), cookies array (for set), domain/name/file filters. get returns truncated list (values redacted). set validates url/domain. delete/clear auto-backups to data/cookies + rotates 20. export saves encrypted, import decrypts. Returns counts + backup paths.", {
     action: z.enum(["get", "set", "delete", "clear", "export", "import"]).default("get"),
     cookies: z.array(z.object({
       name: z.string(),
@@ -1689,7 +1689,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 34. bookmark_add
-  server.tool("bookmark_add", "Add a bookmark (updates title/tags if the URL already exists)", {
+  server.tool("bookmark_add", "Save bookmark to data/bookmarks.json. Args: url (required), title (required), tags string[] (lowercased deduped). Upserts by exact url. Returns created/updated, id, url, tags. Use to remember important pages for later bookmark_search.", {
     url: z.string().url(),
     title: z.string(),
     tags: z.array(z.string()).default([]),
@@ -1711,7 +1711,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 35. bookmark_delete
-  server.tool("bookmark_delete", "Delete a bookmark by id (or by exact URL)", {
+  server.tool("bookmark_delete", "Remove bookmark by id or exact url. Args: id optional, url optional (one required). Returns deleted bool, id/url. No-op if not found.", {
     id: z.string().optional(),
     url: z.string().optional(),
   }, guard(async ({ id, url }) => {
@@ -1724,7 +1724,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 36. bookmark_search
-  server.tool("bookmark_search", "Search bookmarks by keyword and/or tags", {
+  server.tool("bookmark_search", "Search saved bookmarks by keyword (title/url/tags substring) and/or tags (must include). Args: query string, tags string[], limit 1-200. Sorted by createdAt desc. Returns matches or \"No bookmarks found.\".", {
     query: z.string().default(""),
     tags: z.array(z.string()).default([]),
     limit: z.number().int().min(1).max(200).default(50),
@@ -1746,12 +1746,12 @@ export function registerTools(server, ctx) {
   }));
 
   // 37. bookmark_list
-  server.tool("bookmark_list", "List all saved bookmarks", {}, guard(async () => {
+  server.tool("bookmark_list", "List all saved bookmarks sorted by createdAt desc. No args. Returns array or \"No bookmarks saved.\".", {}, guard(async () => {
     return json(bookmarks.length ? bookmarks : "No bookmarks saved.");
   }));
 
   // 38. history_search
-  server.tool("history_search", "Search recorded navigation history (most recent first)", {
+  server.tool("history_search", "Search navigation history (data/history.json, capped 5000). Args: query string, hours 1-168 (default 24h cutoff), limit 1-500. Filters by title/url then slices most recent. Returns matches or \"No history found.\".", {
     query: z.string().default(""),
     hours: z.number().int().min(1).max(168).default(24),
     limit: z.number().int().min(1).max(500).default(50),
@@ -1768,7 +1768,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 39. hover
-  server.tool("hover", "Hover over an element to reveal hover menus, tooltips, or submenus", {
+  server.tool("hover", "Hover to reveal tooltips/menus. Args: selector/by_text/scope/ref or x/y coords (dispatches mouseMoved at coords). Tries content.js scrollIntoView + pointer/mouse sequence, falls back to eval pageHover. Returns hovered bool, x/y. Call before clicking hover-only controls.", {
     selector: z.string().optional(),
     by_text: z.string().optional(),
     scope: z.string().optional(),
@@ -1780,7 +1780,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 42. computer — unified dispatcher over the same primitives (P0.1: fill ref→selector scopeSel, hover cdp, viewport)
-  server.tool("computer", "Unified interaction: click, double_click, right_click, move, type, fill, key, scroll, hover, wait, navigate, screenshot", {
+  server.tool("computer", "Unified dispatcher — single tool for most interactions (mirrors computer-use). Args: action (click|double_click|right_click|move|type|fill|key|scroll|hover|wait|navigate|screenshot), plus per-action fields: selector/by_text/scope/ref, text (for type/fill), x/y, key, url, button, scroll_direction/amount, delay (for type), width/height/background (for navigate). Routes via performClick/Type/Hover etc. Returns same as individual tools. Prefer for agent loops.", {
     action: z.enum(["click", "double_click", "right_click", "move", "type", "fill", "key", "scroll", "hover", "wait", "navigate", "screenshot"]),
     selector: z.string().optional(),
     by_text: z.string().optional(),
@@ -1857,7 +1857,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 41. health
-  server.tool("health", "Server status, connection transport, store sizes, live refs, and uptime", {}, guard(async () => {
+  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.9, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
     const state = await bridge.browser.state().catch(() => null);
     return json({
       server: "browser-navigator v2.0.9",
