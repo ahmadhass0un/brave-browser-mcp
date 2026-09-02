@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser Navigator — Dashboard</title>
+<link rel="icon" type="image/png" sizes="32x32" href="icons/icon32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="icons/icon16.png">
+<style>
+:root{color-scheme:dark;--bg:#1b1c1f;--card:#26282c;--card2:#2d2f33;--border:#3c4043;--fg:#e8eaed;--muted:#9aa0a6;--accent:#8ab4f8;--accent2:#aecbfa;--ok:#81c995;--warn:#fdd663;--err:#f28b82;--radius:12px}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);display:flex;min-height:100vh}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+button{font:inherit}
+
+/* sidebar */
+nav{width:220px;flex:none;background:var(--card);border-right:1px solid var(--border);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow:auto}
+.nav-head{padding:18px 16px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.nav-head img{width:28px;height:28px}
+.nav-head h1{margin:0;font-size:15px;line-height:1.1}
+.nav-head h1 span{font-weight:400;color:var(--muted);font-size:12px}
+.nav-head small{color:var(--muted);font-size:11px}
+.nav-links{padding:10px 8px;display:flex;flex-direction:column;gap:2px;flex:1}
+.nav-links button{width:100%;text-align:left;padding:9px 12px;border-radius:8px;border:1px solid transparent;background:transparent;color:var(--muted);cursor:pointer;display:flex;align-items:center;gap:10px;font-size:13px}
+.nav-links button:hover{background:rgba(138,180,248,.1);color:var(--fg)}
+.nav-links button.active{background:var(--accent);color:#202124;font-weight:600;border-color:var(--accent)}
+.nav-links button .ico{width:18px;text-align:center}
+.nav-foot{padding:10px 12px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)}
+.nav-foot .dot{width:8px;height:8px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:var(--muted)}
+.nav-foot .dot.connected{background:var(--ok)}
+.nav-foot .dot.reconnecting{background:var(--warn);animation:pulse 1.2s infinite}
+.nav-foot .dot.disconnected{background:var(--err)}
+@keyframes pulse{50%{opacity:.3}}
+
+/* main */
+main{flex:1;min-width:0;padding:24px;max-width:1100px;margin:0 auto;width:100%}
+.page{display:none}
+.page.active{display:block}
+.page h2{margin:0 0 14px;font-size:18px}
+.page h3{margin:18px 0 8px;font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:14px}
+.card h4{margin:0 0 10px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr} nav{width:64px} nav .label, nav .nav-head h1, nav .nav-head small, nav .nav-foot span{display:none} nav .nav-links button{justify-content:center}}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;font-size:13px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;word-break:break-all}
+input, select, textarea{width:100%;padding:9px 12px;font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:8px;outline:none}
+input:focus, select:focus, textarea:focus{border-color:var(--accent)}
+textarea{resize:vertical;min-height:80px}
+.btn{padding:7px 14px;border-radius:8px;border:1px solid var(--border);background:var(--card2);color:var(--fg);cursor:pointer}
+.btn:hover{border-color:var(--accent);background:rgba(138,180,248,.12)}
+.btn-primary{background:var(--accent);color:#202124;border-color:var(--accent);font-weight:600}
+.btn-primary:hover{background:var(--accent2)}
+.btn:disabled{opacity:.45;cursor:default}
+.btn-sm{padding:5px 10px;font-size:12px}
+.status{display:flex;align-items:center;gap:8px}
+.badge{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--card2);border:1px solid var(--border);color:var(--muted)}
+.tabs-list{max-height:420px;overflow:auto}
+.tab-row{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;border:1px solid transparent}
+.tab-row:hover{background:rgba(138,180,248,.08);border-color:var(--border)}
+.tab-row.active{background:rgba(138,180,248,.14);border-color:rgba(138,180,248,.3)}
+.tab-row img{width:16px;height:16px;border-radius:3px;background:var(--border);flex:none}
+.tab-row .t{flex:1;min-width:0}
+.tab-row .t .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500}
+.tab-row .t .url{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px;color:var(--muted)}
+.mono{font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;max-height:300px;overflow:auto}
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
+.gallery img{width:100%;border-radius:8px;border:1px solid var(--border);background:var(--bg)}
+.hist-item{padding:8px 0;border-bottom:1px solid var(--border);display:flex;gap:10px}
+.hist-item:last-child{border:0}
+.hist-item .time{color:var(--muted);font-size:11px;white-space:nowrap}
+.notice{color:var(--muted);font-size:13px;text-align:center;padding:20px}
+#error{color:var(--err);background:rgba(242,139,130,.08);border:1px solid rgba(242,139,130,.25);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-word;display:none}
+#error:not(:empty){display:block}
+</style>
+</head>
+<body>
+<nav>
+  <div class="nav-head">
+    <img src="icons/icon48.png" alt="">
+    <div>
+      <h1>Browser Navigator</h1>
+      <small id="nav-ver">v—</small>
+    </div>
+  </div>
+  <div class="nav-links">
+    <button class="active" data-page="overview"><span class="ico">◉</span> <span class="label">Overview</span></button>
+    <button data-page="browser"><span class="ico">▭</span> <span class="label">Browser</span></button>
+    <button data-page="tools"><span class="ico">⚡</span> <span class="label">Tools</span></button>
+    <button data-page="captures"><span class="ico">📸</span> <span class="label">Captures</span></button>
+    <button data-page="settings"><span class="ico">⚙</span> <span class="label">Settings</span></button>
+    <button data-page="logs"><span class="ico">≡</span> <span class="label">Logs</span></button>
+  </div>
+  <div class="nav-foot">
+    <span id="foot-dot" class="dot"></span><span id="foot-label">Checking…</span><br>
+    <span id="foot-transport" style="font-size:11px;color:var(--muted)"></span>
+  </div>
+</nav>
+<main>
+  <!-- OVERVIEW -->
+  <div id="page-overview" class="page active">
+    <h2>Overview</h2>
+    <div class="grid2">
+      <div class="card">
+        <h4>Connection</h4>
+        <div class="status"><span id="ov-dot" class="dot" style="width:10px;height:10px"></span> <strong id="ov-status">—</strong> <span id="ov-transport" class="badge"></span></div>
+        <div id="ov-error" style="margin-top:8px;color:var(--err);font-size:12px;white-space:pre-wrap"></div>
+        <div class="kv" style="margin-top:12px">
+          <dt>Server URL</dt><dd id="ov-url">—</dd>
+          <dt>Uptime</dt><dd id="ov-uptime">—</dd>
+          <dt>Bookmarks</dt><dd id="ov-bm">—</dd>
+          <dt>History entries</dt><dd id="ov-hist">—</dd>
+        </div>
+      </div>
+      <div class="card">
+        <h4>Browser</h4>
+        <dl class="kv" id="ov-browser"></dl>
+        <div class="row" style="margin-top:10px">
+          <button class="btn btn-sm" data-page-jump="browser">Manage tabs →</button>
+          <button class="btn btn-sm" id="ov-newtab">+ New tab</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h4>Current tab</h4>
+      <div id="ov-cur" class="notice">Loading…</div>
+    </div>
+  </div>
+
+  <!-- BROWSER -->
+  <div id="page-browser" class="page">
+    <h2>Browser <span id="browser-meta" style="font-weight:400;color:var(--muted);font-size:13px"></span></h2>
+    <div class="card">
+      <div class="row"><input id="browser-filter" placeholder="Filter tabs by title or URL…"><button id="browser-refresh" class="btn">Refresh</button></div>
+      <div id="browser-tabs" class="tabs-list" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <h4>Windows</h4>
+      <div id="browser-wins" class="notice">Loading…</div>
+    </div>
+    <div class="card">
+      <h4>Quick actions on selected tab</h4>
+      <div class="row" style="margin-bottom:8px"><select id="qa-tab"></select><span style="color:var(--muted);font-size:11px">pick a browser tab to act on — not the Dashboard itself</span></div>
+      <div class="row">
+        <button class="btn" id="qa-shot2">📸 Screenshot</button>
+        <button class="btn" id="qa-pdf2">📄 PDF</button>
+        <button class="btn" id="qa-read2">♿ Read page</button>
+        <button class="btn" id="qa-list2">🔍 List elements</button>
+      </div>
+      <pre id="qa-out2" class="mono" style="margin-top:10px;display:none"></pre>
+    </div>
+  </div>
+
+  <!-- TOOLS -->
+  <div id="page-tools" class="page">
+    <h2>Tools</h2>
+    <div class="card">
+      <div class="grid2">
+        <label>Tool <select id="tool-name"></select></label>
+        <label>Target tab <select id="tool-tab"></select></label>
+      </div>
+      <label style="display:block;margin-top:10px">Arguments (JSON) <textarea id="tool-args" placeholder='{"selector":"h1"}'></textarea></label>
+      <div class="row" style="margin-top:8px"><button id="tool-run" class="btn btn-primary">Run tool</button><button id="tool-clear" class="btn">Clear</button></div>
+      <pre id="tool-out" class="mono" style="margin-top:10px;display:none"></pre>
+    </div>
+    <div class="card">
+      <h4>DOM helper</h4>
+      <div class="row"><input id="dom-sel" placeholder="CSS selector, e.g. button"><button id="dom-exists" class="btn btn-sm">Exists?</button><button id="dom-inspect" class="btn btn-sm">Inspect</button><button id="dom-text" class="btn btn-sm">Get text</button></div>
+      <pre id="dom-out" class="mono" style="margin-top:8px;display:none"></pre>
+    </div>
+  </div>
+
+  <!-- CAPTURES -->
+  <div id="page-captures" class="page">
+    <h2>Captures</h2>
+    <div class="card">
+      <div class="row"><button id="cap-shot" class="btn btn-primary">📸 Capture visible tab</button><button id="cap-full" class="btn">Full page</button><button id="cap-pdf2" class="btn">📄 PDF</button></div>
+      <div id="cap-preview" style="margin-top:12px;display:none"><img id="cap-img" style="max-width:100%;border:1px solid var(--border);border-radius:8px"><div id="cap-meta" class="notice"></div></div>
+    </div>
+    <div class="card"><h4>Recent captures</h4><div id="cap-gallery" class="gallery"><div class="notice">No captures yet — take one!</div></div></div>
+  </div>
+
+  <!-- SETTINGS -->
+  <div id="page-settings" class="page">
+    <h2>Settings</h2>
+    <div class="card">
+      <h4>Server</h4>
+      <label style="display:block;margin-bottom:10px">WebSocket server URL <input id="set-url" placeholder="ws://127.0.0.1:9224"></label>
+      <div class="row" style="margin-top:12px"><button id="set-save" class="btn btn-primary">Save</button><span id="set-note" style="color:var(--ok);font-size:12px"></span></div>
+    </div>
+    <div class="card"><h4>Browser</h4><dl class="kv" id="set-browser"></dl></div>
+  </div>
+
+  <!-- LOGS -->
+  <div id="page-logs" class="page">
+    <h2>Logs</h2>
+    <div class="card">
+      <div class="row"><button id="log-clear" class="btn btn-sm">Clear</button><button id="log-copy" class="btn btn-sm">Copy</button><span style="color:var(--muted);font-size:12px;margin-left:auto">Live tab/window events</span></div>
+      <pre id="log-out" class="mono" style="margin-top:10px;min-height:200px"></pre>
+    </div>
+  </div>
+
+</main>
+<script src="dashboard.js"></script>
+</body>
+</html>

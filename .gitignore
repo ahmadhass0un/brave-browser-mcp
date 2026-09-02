@@ -1,6 +1,12 @@
 node_modules/
-screenshots/
-cookies/
+data/screenshots/*
+data/cookies/*
+data/history/*.json
+!data/history/.gitkeep
+!data/bookmarks/.gitkeep
+!data/screenshots/.gitkeep
+!data/cookies/.gitkeep
 *.log
 .DS_Store
+browser-profiles/
 .env

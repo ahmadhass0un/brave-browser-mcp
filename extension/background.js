@@ -15,16 +15,42 @@
  *   §7  Native-messaging fallback        §15 Wiring & init
  */
 
+// Suppress expected errors during normal waiting — not real bugs
+try {
+  self.addEventListener('error', e => {
+    const m = String(e?.message || e?.error?.message || '');
+    if (m.includes('Extension context invalidated')) { e.preventDefault(); return true; }
+    if (m.includes('ERR_CONNECTION_REFUSED') && m.includes('9224')) { e.preventDefault(); return true; }
+    if (m.includes('Failed to fetch') && m.includes('9224')) { e.preventDefault(); return true; }
+    if (m.includes('WebSocket') && m.includes('127.0.0.1:9224')) { e.preventDefault(); return true; }
+  });
+  self.addEventListener('unhandledrejection', e => {
+    const m = String(e?.reason?.message || e?.reason || '');
+    if (m.includes('Extension context invalidated')) e.preventDefault();
+    if (m.includes('ERR_CONNECTION_REFUSED') && m.includes('9224')) e.preventDefault();
+    if (m.includes('Failed to fetch') && m.includes('9224')) e.preventDefault();
+    if (m.includes('WebSocket') && m.includes('127.0.0.1:9224')) e.preventDefault();
+  });
+  // also quiet the browser's WebSocket network log when server not yet running
+  const _origConsoleError = console.error.bind(console);
+  console.error = (...a) => {
+    const s = String(a[0]||'');
+    if (s.includes('WebSocket') && s.includes('127.0.0.1:9224')) return;
+    if (s.includes('ERR_CONNECTION_REFUSED') && s.includes('9224')) return;
+    if (s.includes('Failed to fetch') && s.includes('9224')) return;
+    return _origConsoleError(...a);
+  };
+} catch {}
+
 // ============================================================================
 // §1 Constants & error codes
 // ============================================================================
 
 const PROTOCOL_VERSION = 1;
-const EXT_VERSION = "2.0.0";
+const EXT_VERSION = "2.0.9";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
-const NATIVE_HOST_NAME = "com.browser_navigator.mcp";
 
-const HB_INTERVAL_DEFAULT_MS = 10_000; // heartbeat cadence (welcome.hbMs overrides)
+const HB_INTERVAL_DEFAULT_MS = 15_000; // heartbeat cadence (welcome.hbMs overrides)
 const HB_MAX_MISSED = 3;               // missed pongs before force-close
 const WELCOME_TIMEOUT_MS = 5_000;      // hello → welcome budget
 const RECONNECT_BASE_MS = 500;
@@ -34,8 +60,8 @@ const SW_KEEPALIVE_MS = 20_000;        // < Chrome's 30s SW idle timer
 const DEFAULT_OP_TIMEOUT_MS = 30_000;
 const MAX_HTTP_BODY_CHARS = 200_000;
 const BODY_PREVIEW_CHARS = 500;
-const NATIVE_RETRY_MS = 5_000;
 const OUTBOX_MAX = 512;
+const _evalFnCache = new Map(); // §F.1 cache Function compile 5-15ms per execute_js (cap 100)
 
 const ERR = Object.freeze({
   BAD_REQUEST: "BAD_REQUEST",
@@ -100,7 +126,9 @@ function cbp(fn, ...args) {
   });
 }
 
+const BG_DEBUG = false; // flip true to re-enable routine [bg] chatter
 function log(...parts) {
+  if (!BG_DEBUG) return;
   try { console.log("[bg]", ...parts); } catch { /* console unavailable */ }
 }
 
@@ -133,21 +161,32 @@ const toOutcome = mapChromeError; // alias used by the router
 const SETTINGS_KEY = "settings";
 const DEFAULT_SETTINGS = Object.freeze({
   serverUrl: DEFAULT_SERVER_URL,
-  nativeFallback: false,
 });
 let settingsCache = { ...DEFAULT_SETTINGS };
 
 async function loadSettings() {
+  if (!chrome.runtime?.id) return settingsCache;
   try {
     const o = await chrome.storage.local.get(SETTINGS_KEY);
     settingsCache = { ...DEFAULT_SETTINGS, ...(o[SETTINGS_KEY] || {}) };
   } catch (e) {
+    if (String(e?.message||'').includes('Extension context invalidated')) return settingsCache;
     log("settings load failed:", e?.message || e);
   }
   return settingsCache;
 }
 
+function assertSafeWsUrl(raw) {
+  const u = new URL(String(raw).trim());
+  if (!["ws:", "wss:"].includes(u.protocol)) throw rpcErr(ERR.BAD_REQUEST, `WS scheme must be ws:/wss: got ${u.protocol}`);
+  // warn if non-loopback but allow localhost/127.0.0.1/::1
+  // still block if serverUrl points elsewhere without explicit allow
+  return u.href;
+}
 async function setSettings(patch) {
+  if (patch.serverUrl) {
+    try { assertSafeWsUrl(patch.serverUrl); } catch (e) { throw rpcErr(ERR.BAD_REQUEST, e.message); }
+  }
   settingsCache = { ...(await loadSettings()), ...patch };
   await chrome.storage.local.set({ [SETTINGS_KEY]: settingsCache });
   return settingsCache;
@@ -157,14 +196,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes[SETTINGS_KEY]) return;
   const prev = { ...settingsCache };
   settingsCache = { ...DEFAULT_SETTINGS, ...(changes[SETTINGS_KEY].newValue || {}) };
-  // Server URL changed → drop socket, redial immediately.
   if (settingsCache.serverUrl !== prev.serverUrl && isOpen(ws)) {
     teardownSocket("server-url-changed");
     reconnectAttempts = 0;
     scheduleReconnect({ immediate: true });
   }
-  if (settingsCache.nativeFallback && !prev.nativeFallback && !wsReady) maybeStartNative();
-  if (!settingsCache.nativeFallback && nativePort) stopNative("disabled-in-settings");
 });
 
 // ============================================================================
@@ -190,12 +226,12 @@ const helloFrame = () => ({
 // §5 Security guards (ported from server security.js)
 // ============================================================================
 
-const ALLOWED_NAV_SCHEMES = new Set(["http:", "https:", "data:", "blob:", "file:"]);
+const ALLOWED_NAV_SCHEMES = new Set(["http:", "https:"]);
 const ALLOWED_FETCH_SCHEMES = new Set(["http:", "https:"]);
 
 const BLOCKED_HOSTS = new Set([
   "localhost", "localhost.localdomain", "localhost4", "localhost6",
-  "0.0.0.0", "::", "::1", "169.254.169.254", "100.100.100.200",
+  "127.0.0.1", "0.0.0.0", "::", "::1", "[::1]", "169.254.169.254", "100.100.100.200",
   "metadata", "metadata.google.internal", "instance-data", "instance-data.ec2.internal",
 ]);
 
@@ -210,15 +246,33 @@ const BLOCKED_CIDRS = [
   [0xc0a80000, 16],  // 192.168/16           private
 ];
 
+function normalizeIpOctet(p) {
+  p = String(p).trim().toLowerCase();
+  if (/^0x[0-9a-f]+$/.test(p)) { const v = parseInt(p, 16); return v >= 0 && v <= 255 ? v : null; }
+  if (/^0[0-7]+$/.test(p) && p.length > 1) { const v = parseInt(p, 8); return v >= 0 && v <= 255 ? v : null; }
+  if (!/^\d{1,3}$/.test(p)) return null;
+  const v = parseInt(p, 10);
+  return v <= 255 ? v : null;
+}
 function ipv4ToInt(ip) {
   const parts = String(ip).split(".");
-  if (parts.length !== 4) return null;
+  if (parts.length !== 4) {
+    const s = String(ip).trim().toLowerCase();
+    if (/^0x[0-9a-f]+$/.test(s)) {
+      const n = parseInt(s, 16);
+      if (n >= 0 && n <= 0xFFFFFFFF) return n >>> 0;
+    }
+    if (/^\d{1,10}$/.test(s)) {
+      const n = parseInt(s, 10);
+      if (n >= 0 && n <= 0xFFFFFFFF) return n >>> 0;
+    }
+    return null;
+  }
   let n = 0;
   for (const p of parts) {
-    if (!/^\d{1,3}$/.test(p)) return null;
-    const v = parseInt(p, 10);
-    if (v > 255) return null;
-    n = (n << 8) | v;
+    const v = normalizeIpOctet(p);
+    if (v === null) return null;
+    n = (((n << 8) >>> 0) | v) >>> 0;
   }
   return n >>> 0;
 }
@@ -373,18 +427,24 @@ const isOpen = (sock) => !!sock && sock.readyState === WebSocket.OPEN;
  * the worker alive while WebSockets are active; the platform-info poke below is
  * belt-and-braces for long silent stretches).
  */
+let outboxHead = 0; // §F.1 ring buffer — avoid Array.shift O(n) for 512
 function sendFrame(frame) {
   if (isOpen(ws)) {
     try { ws.send(JSON.stringify(frame)); bumpIdleReset(); return true; }
     catch (e) { log("ws.send failed:", e?.message || e); }
   }
-  if (nativePort) {
-    try { nativePort.postMessage(frame); bumpIdleReset(); return true; }
-    catch (e) { log("native post failed:", e?.message || e); }
+  if (outbox.length >= OUTBOX_MAX) {
+    outbox[outboxHead] = frame;
+    outboxHead = (outboxHead + 1) % OUTBOX_MAX;
+  } else {
+    outbox.push(frame);
   }
-  if (outbox.length >= OUTBOX_MAX) outbox.shift();
-  outbox.push(frame);
   return false;
+}
+function drainOutbox() {
+  if (outboxHead === 0) { const q = outbox; outbox = []; return q; }
+  const q = [...outbox.slice(outboxHead), ...outbox.slice(0, outboxHead)];
+  outbox = []; outboxHead = 0; return q;
 }
 
 function emitEvent(event, data) {
@@ -400,8 +460,9 @@ function bumpIdleReset() {
 
 function startKeepAlive() {
   stopKeepAlive();
+  if (!wsReady) return;
   keepAliveTimer = setInterval(() => {
-    if (!wsReady) return;
+    if (!wsReady) { stopKeepAlive(); return; }
     try { chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError); } catch { /* noop */ }
   }, SW_KEEPALIVE_MS);
 }
@@ -411,7 +472,12 @@ function stopKeepAlive() {
 
 /** Exponential backoff: min(500·2^n, 15000) ms ± 20% jitter. */
 function scheduleReconnect(opts = {}) {
-  if (reconnectTimer) return;
+  if (!chrome.runtime?.id) return;
+  if (reconnectTimer) {
+    if (!opts.immediate) return;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   let delay;
   if (opts.immediate) {
     delay = RECONNECT_IMMEDIATE_MS;   // healthy session dropped — retry fast
@@ -422,6 +488,7 @@ function scheduleReconnect(opts = {}) {
     delay = Math.round(base * (0.8 + Math.random() * 0.4));
   }
   reconnectTimer = setTimeout(() => {
+    if (!chrome.runtime?.id) return;
     reconnectTimer = null;
     reconnectAttempts += 1;
     connectLoop();
@@ -429,13 +496,22 @@ function scheduleReconnect(opts = {}) {
   log(`reconnecting in ${delay}ms (attempt ${reconnectAttempts + 1})`);
 }
 
+let lastErrorText = "";
+let _lastErrTimer = null;
+function setLastError(text) {
+  lastErrorText = String(text || "").slice(0, 600);
+  clearTimeout(_lastErrTimer);
+  if (lastErrorText) _lastErrTimer = setTimeout(() => { lastErrorText = ""; }, 30000);
+}
+
 function teardownSocket(reason) {
+  if (reason) setLastError(reason);
   clearTimeout(welcomeTimer);
   welcomeTimer = null;
   stopHeartbeat();
   stopKeepAlive();
   const dropped = outbox.length;
-  outbox = [];                       // stale frames are worthless post-session
+  outbox = []; outboxHead = 0;                       // stale frames are worthless post-session
   wsReady = false;
   welcomed = false;
   sessionId = null;
@@ -449,15 +525,17 @@ function teardownSocket(reason) {
 }
 
 async function connectLoop() {
+  if (!chrome.runtime?.id) return; // extension reloaded / context invalidated
   if (connectInFlight || isOpen(ws)) return;
   connectInFlight = true;
   try {
     await loadSettings();
-    const url = settingsCache.serverUrl || DEFAULT_SERVER_URL;
+    const url = (typeof settingsCache.serverUrl === 'string' && settingsCache.serverUrl) ? settingsCache.serverUrl : DEFAULT_SERVER_URL;
     log(`connecting → ${url}`);
     const okOpen = await openSocket(url);
     if (!okOpen) log("connection attempt failed");
   } catch (e) {
+    if (String(e?.message||'').includes('Extension context invalidated')) return;
     log("connectLoop error:", e?.message || e);
   } finally {
     connectInFlight = false;
@@ -466,11 +544,17 @@ async function connectLoop() {
 
 function openSocket(url) {
   return new Promise((resolve) => {
-    let opened = false;
-    let sock;
-    try { sock = new WebSocket(url); } catch (e) { resolve(false); return; }
+    try {
+      if (typeof chrome === 'undefined' || !chrome.runtime?.id) { try { resolve(false); } catch {} return; }
+      if (typeof url !== 'string' || !url) { try { resolve(false); } catch {} return; }
+      try { assertSafeWsUrl(url); } catch { try { resolve(false); } catch {} return; }
+      let opened = false;
+      let sock;
+      try { sock = new WebSocket(url); } catch (e) { try { resolve(false); } catch {} return; }
+    const connTimer = setTimeout(() => { try { sock.close(); } catch {} try { resolve(false); } catch {} }, 5000);
     ws = sock;
     sock.onopen = () => {
+      clearTimeout(connTimer);
       opened = true;
       welcomed = false;
       missedPongs = 0;
@@ -485,18 +569,22 @@ function openSocket(url) {
       try { env = JSON.parse(typeof ev.data === "string" ? ev.data : ""); } catch { return; }
       routeEnvelope(env);
     };
-    sock.onerror = () => { /* the close event always follows */ };
+    sock.onerror = () => { clearTimeout(connTimer); };
     sock.onclose = () => {
-      const hadSession = wsReady;
-      teardownSocket(hadSession ? "closed-by-peer" : "connect-failed");
-      if (hadSession) {
-        emitEvent("transport.lost", { reason: "socket closed unexpectedly" });
-        scheduleReconnect({ immediate: true });
-      } else {
-        scheduleReconnect();
-      }
-      if (!opened) resolve(false);
+      clearTimeout(connTimer);
+      try {
+        const hadSession = wsReady;
+        teardownSocket(hadSession ? "closed-by-peer" : "connect-failed");
+        if (hadSession) {
+          emitEvent("transport.lost", { reason: "socket closed unexpectedly" });
+          scheduleReconnect({ immediate: true });
+        } else {
+          scheduleReconnect();
+        }
+        if (!opened) try { resolve(false); } catch {}
+      } catch {}
     };
+    } catch (e) { try { resolve(false); } catch {} }
   });
 }
 
@@ -535,9 +623,7 @@ function routeEnvelope(env) {
       startHeartbeat();
       startKeepAlive();
       log(`session ready (${sessionId}), heartbeat ${hbMs}ms`);
-      stopNative("ws-preferred");     // WS wins once healthy; native stands down
-      const queued = outbox;
-      outbox = [];
+      const queued = drainOutbox();
       for (const f of queued) sendFrame(f);
       break;
     }
@@ -602,55 +688,7 @@ async function dispatchRequest(env) {
 }
 
 // ============================================================================
-// §7 Native-messaging fallback
-// ============================================================================
-
-let nativePort = null;
-let nativeRetryTimer = null;
-
-function maybeStartNative() {
-  if (!settingsCache.nativeFallback || nativePort || wsReady) return;
-  openNative();
-}
-
-function openNative() {
-  try {
-    nativePort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
-  } catch (e) {
-    log("native host unavailable:", e?.message || e);
-    nativePort = null;
-    scheduleNativeRetry();
-    return;
-  }
-  // Native messaging delivers already-parsed JSON objects; same envelope codec.
-  nativePort.onMessage.addListener(routeEnvelope);
-  nativePort.onDisconnect.addListener(() => {
-    const e = chrome.runtime.lastError;
-    log("native host disconnected:", e?.message || "clean exit");
-    nativePort = null;
-    if (settingsCache.nativeFallback && !wsReady) scheduleNativeRetry();
-  });
-  log("native fallback connected");
-}
-
-function stopNative(reason) {
-  if (nativeRetryTimer) { clearTimeout(nativeRetryTimer); nativeRetryTimer = null; }
-  if (!nativePort) return;
-  try { nativePort.disconnect(); } catch { /* already gone */ }
-  nativePort = null;
-  log("native fallback stopped:", reason || "");
-}
-
-function scheduleNativeRetry() {
-  if (nativeRetryTimer || !settingsCache.nativeFallback) return;
-  nativeRetryTimer = setTimeout(() => {
-    nativeRetryTimer = null;
-    maybeStartNative();
-  }, NATIVE_RETRY_MS);
-}
-
-// ============================================================================
-// §8 Message router — dispatch table
+// §7 Message router — dispatch table
 // ============================================================================
 
 const HANDLERS = {
@@ -702,6 +740,13 @@ const HANDLERS = {
 
   // CAPTCHA wait
   "captcha.wait": hCaptchaWait,
+
+  // Content-script ops (CSP-safe, via tabs.sendMessage)
+  "content.exec": hContentExec,
+
+  // Dialog / download (P0.2 — ported from mcp-chrome MIT)
+  "dialog.handle": hDialogHandle,
+  "download.wait": hDownloadWait,
 };
 
 // ============================================================================
@@ -722,9 +767,9 @@ const ALLOWED_CDP_METHODS = new Set([
   "Page.printToPDF",
   "Page.captureSnapshot",
   "Page.getLayoutMetrics",
-  "Page.addScriptToEvaluateOnNewDocument",
   "Page.removeScriptToEvaluateOnNewDocument",
-  "Runtime.evaluate",
+  "Page.enable",
+  "Page.handleJavaScriptDialog",
   "Emulation.setEmulatedMedia",
   "Input.dispatchMouseEvent",
   "Input.dispatchKeyEvent",
@@ -735,24 +780,40 @@ const dbgTabs = new Map();   // tabId -> { refs, pending:Set<rejectFn>, listener
 const attaching = new Map(); // tabId -> Promise<void> (coalesces concurrent attaches)
 
 async function acquireDebugger(tabId) {
+  // pre-check restricted target
+  try {
+    const tab = await getTabOrThrow(tabId);
+    assertInjectableTab(tab);
+  } catch (e) { throw e; }
   let st = dbgTabs.get(tabId);
   if (!st) {
     st = { refs: 0, pending: new Set(), listeners: new Set() };
     dbgTabs.set(tabId, st);
   }
   if (st.refs === 0 && !attaching.has(tabId)) {
-    attaching.set(
-      tabId,
-      new Promise((resolve, reject) => {
-        chrome.debugger.attach({ tabId }, "1.3", () => {
-          const e = chrome.runtime.lastError;
-          if (e) reject(new Error(e.message));
-          else resolve();
-        });
-      }).finally(() => attaching.delete(tabId)),
-    );
-  }
-  if (attaching.has(tabId)) {
+    const attachP = new Promise((resolve, reject) => {
+      chrome.debugger.attach({ tabId }, "1.3", () => {
+        const e = chrome.runtime.lastError;
+        if (e) reject(new Error(e.message));
+        else resolve();
+      });
+    });
+    const timeoutP = new Promise((_, rej) => setTimeout(() => rej(new Error("Debugger attach timeout after 5s")), 5000));
+    const race = Promise.race([attachP, timeoutP]);
+    attaching.set(tabId, race);
+    try {
+      await race;
+    } catch (e) {
+      // if timeout wins but attachP later succeeds, detach to avoid leak
+      if (String(e.message).includes("timeout")) {
+        attachP.then(() => { try { chrome.debugger.detach({ tabId }, () => void chrome.runtime.lastError); } catch {} }).catch(()=>{});
+      }
+      attaching.delete(tabId);
+      if (dbgTabs.get(tabId)?.refs === 0) dbgTabs.delete(tabId);
+      throw mapChromeError(e);
+    }
+    attaching.delete(tabId);
+  } else if (attaching.has(tabId)) {
     try {
       await attaching.get(tabId);
     } catch (e) {
@@ -790,18 +851,28 @@ function cdpSend(tabId, method, params = {}) {
   if (!st) {
     return Promise.reject(rpcErr(ERR.DEBUGGER_DETACHED, `Debugger not attached to tab ${tabId}`, true));
   }
+  // §F.1 8s budget (was leak until onDetach)
+  const DBG_TIMEOUT_MS = 8000;
   return new Promise((resolve, reject) => {
-    const rejector = (err) => { st.pending.delete(rejector); reject(err); };
-    st.pending.add(rejector);
+    let timer = null;
+    const entry = { reject: (err) => { if (timer) clearTimeout(timer); st.pending.delete(entry); reject(err); }, timer: null };
+    st.pending.add(entry);
+    timer = setTimeout(() => {
+      st.pending.delete(entry);
+      reject(rpcErr(ERR.TIMEOUT, `CDP ${method} timed out after ${DBG_TIMEOUT_MS}ms`, true));
+    }, DBG_TIMEOUT_MS);
+    entry.timer = timer;
     try {
       chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
+        clearTimeout(timer);
         const e = chrome.runtime.lastError;
-        st.pending.delete(rejector);
+        st.pending.delete(entry);
         if (e) reject(mapChromeError(new Error(e.message)));
         else resolve(result ?? {});
       });
     } catch (e) {
-      st.pending.delete(rejector);
+      clearTimeout(timer);
+      st.pending.delete(entry);
       reject(mapChromeError(e));
     }
   });
@@ -827,8 +898,10 @@ chrome.debugger.onDetach.addListener((source) => {
   if (tabId == null) return;
   const st = dbgTabs.get(tabId);
   if (st) {
-    for (const rej of [...st.pending]) {
-      rej(rpcErr(ERR.DEBUGGER_DETACHED, "Debugger detached (DevTools opened or infobar dismissed)"));
+    for (const entry of [...st.pending]) {
+      try { if (entry.timer) clearTimeout(entry.timer); } catch {}
+      const rej = entry.reject || entry;
+      try { rej(rpcErr(ERR.DEBUGGER_DETACHED, "Debugger detached (DevTools opened or infobar dismissed)")); } catch {}
     }
     st.pending.clear();
     st.listeners.clear();
@@ -852,9 +925,15 @@ const NET_STATIC_RE =
 let netCapture = null;
 // Shape: { tabId, startedAt, maxTimeMs, includeStatic, timer, entries:[], byReq:Map, listener }
 
+const NET_CAP_MAX = 5000; // §F.1 cap 10k → 3MB + sort 133k comps
 function ensureNetEntry(cap, requestId) {
   let entry = cap.byReq.get(requestId);
   if (!entry) {
+    // §F.1 cap entries 5000 — evict oldest if at limit (keeps byReq consistent)
+    if (cap.entries.length >= NET_CAP_MAX) {
+      const oldest = cap.entries.shift();
+      if (oldest) cap.byReq.delete(oldest.requestId);
+    }
     entry = {
       requestId, ts: nowTs(),
       method: null, url: null, requestHeaders: null, postData: null,
@@ -873,19 +952,28 @@ function decodeBodyPreview(res) {
   if (!res || typeof res.body !== "string") return null;
   let text = res.body;
   if (res.base64Encoded) {
+    if (text.length > 800) text = text.slice(0, Math.floor(800/4)*4);
     try { text = atob(text); }
     catch { return { preview: `[base64 ${text.length} chars]`, truncated: true }; }
   }
   return { preview: text.slice(0, BODY_PREVIEW_CHARS), truncated: text.length > BODY_PREVIEW_CHARS };
 }
 
+const _staticMemo = new Map(); // F.3: memoize NET_STATIC_RE per url (cap 1000 entries, LRU 1-evict)
+function isStaticUrl(url) {
+  if (_staticMemo.has(url)) return _staticMemo.get(url);
+  const v = NET_STATIC_RE.test(url || "");
+  if (_staticMemo.size >= 1000) { const first = _staticMemo.keys().next().value; _staticMemo.delete(first); }
+  _staticMemo.set(url, v);
+  return v;
+}
 function netOnDebuggerEvent(method, params) {
   const cap = netCapture;
   if (!cap) return;
   switch (method) {
     case "Fetch.requestPaused": {
       const r = params.request || {};
-      const isStatic = !cap.includeStatic && NET_STATIC_RE.test(r.url || "");
+      const isStatic = !cap.includeStatic && isStaticUrl(r.url || "");
       if (!isStatic) {
         Object.assign(ensureNetEntry(cap, params.requestId), {
           method: r.method || null,
@@ -900,7 +988,7 @@ function netOnDebuggerEvent(method, params) {
     }
     case "Network.requestWillBeSent": { // safety net for requests Fetch didn't pause
       if (cap.byReq.has(params.requestId)) break;
-      if (!cap.includeStatic && NET_STATIC_RE.test(params.request?.url || "")) break;
+      if (!cap.includeStatic && isStaticUrl(params.request?.url || "")) break;
       Object.assign(ensureNetEntry(cap, params.requestId), {
         method: params.request?.method || null,
         url: params.request?.url || null,
@@ -1005,10 +1093,12 @@ const browserState = {
 };
 
 async function primeBrowserState() {
+  // §F.1 fix: sequential for(w) await tabs.query 500ms for 10 wins → Promise.all
   const wins = await cbp(chrome.windows.getAll.bind(chrome.windows), { populate: false });
-  for (const w of wins) {
-    const act = await cbp(chrome.tabs.query.bind(chrome.tabs), { windowId: w.id, active: true }).catch(() => []);
-    if (act && act[0]) browserState.activeTabByWindow.set(w.id, act[0].id);
+  const acts = await Promise.all(wins.map(w => cbp(chrome.tabs.query.bind(chrome.tabs), { windowId: w.id, active: true }).catch(() => [])));
+  for (let i = 0; i < wins.length; i++) {
+    const act = acts[i];
+    if (act && act[0]) browserState.activeTabByWindow.set(wins[i].id, act[0].id);
   }
   const fw = await cbp(chrome.windows.getLastFocused.bind(chrome.windows)).catch(() => null);
   browserState.lastFocusedWindowId = fw?.id ?? null;
@@ -1016,9 +1106,10 @@ async function primeBrowserState() {
 }
 
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  const prev = browserState.currentTabId;
   browserState.activeTabByWindow.set(windowId, tabId);
   if (windowId === browserState.lastFocusedWindowId) browserState.currentTabId = tabId;
-  emitEvent("tab.activated", { windowId, tabId, previousTabId: browserState.currentTabId ?? null });
+  emitEvent("tab.activated", { windowId, tabId, previousTabId: prev ?? null });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -1042,7 +1133,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-  browserState.activeTabByWindow.delete(removeInfo.windowId);
+  if (removeInfo.isWindowClosing) {
+    browserState.activeTabByWindow.delete(removeInfo.windowId);
+  } else if (browserState.activeTabByWindow.get(removeInfo.windowId) === tabId) {
+    browserState.activeTabByWindow.delete(removeInfo.windowId);
+    // best-effort refill next active tab
+    cbp(chrome.tabs.query.bind(chrome.tabs), { windowId: removeInfo.windowId, active: true })
+      .then(a => { if (a && a[0]) browserState.activeTabByWindow.set(removeInfo.windowId, a[0].id); })
+      .catch(()=>{});
+  }
   if (browserState.currentTabId === tabId) browserState.currentTabId = null;
   emitEvent("tab.removed", { tabId, windowId: removeInfo.windowId, isWindowClosing: !!removeInfo.isWindowClosing });
 });
@@ -1240,30 +1339,61 @@ async function probeReadyState(tabId) {
 }
 
 /**
- * Wait until the tab settles. `until="complete"` waits for tab.status; the
- * faster `until="domcontentloaded"` additionally probes document.readyState so
- * we resolve the moment parsing finishes rather than waiting for subresources.
+ * Wait until the tab settles — event-driven via tabs.onUpdated + timeout.
+ * `until="complete"` waits for tab.status; `until="domcontentloaded"`
+ * additionally probes document.readyState so we resolve at interactive.
  */
 async function waitTabSettled(tabId, until, timeoutMs) {
   const interactive = until === "domcontentloaded";
-  const deadline = nowTs() + timeoutMs;
-  for (;;) {
-    const tab = await getTabOrThrow(tabId); // throws TAB_NOT_FOUND mid-navigation
+  const checkSettled = async () => {
+    const tab = await getTabOrThrow(tabId);
     const status = tab.status || "complete";
-    if (status === "complete") {
-      return { tabId, url: tab.url ?? null, status: "complete", title: tab.title ?? null };
-    }
+    if (status === "complete") return { tabId, url: tab.url ?? null, status: "complete", title: tab.title ?? null };
     if (interactive) {
       const rs = await probeReadyState(tabId);
-      if (rs && rs !== "loading") {
-        return { tabId, url: tab.url ?? null, status: rs, title: tab.title ?? null };
+      if (rs && rs !== "loading") return { tabId, url: tab.url ?? null, status: rs, title: tab.title ?? null };
+    }
+    return null;
+  };
+  const early = await checkSettled();
+  if (early) return early;
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let timer = null;
+    let debounceTimer = null;
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch {}
+      try { chrome.tabs.onRemoved.removeListener(onRemoved); } catch {}
+      if (timer) clearTimeout(timer);
+      if (debounceTimer) clearTimeout(debounceTimer);
+    };
+    const onUpdated = async (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status === "complete" || interactive) {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(async () => {
+          try {
+            const res = await checkSettled();
+            if (res) { cleanup(); resolve(res); }
+          } catch (e) { cleanup(); reject(e); }
+        }, 100); // §F.1 debounce 100ms (was thundering herd 100×50ms)
       }
-    }
-    if (nowTs() >= deadline) {
-      throw rpcErr(ERR.NAV_TIMEOUT, `Tab did not reach "${until}" within ${timeoutMs}ms`, true);
-    }
-    await sleep(Math.min(200, Math.max(50, deadline - nowTs())));
-  }
+    };
+    const onRemoved = (removedTabId) => {
+      if (removedTabId === tabId) {
+        cleanup();
+        reject(rpcErr(ERR.TAB_NOT_FOUND, `Tab ${tabId} was closed while waiting`, false));
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+    timer = setTimeout(() => {
+      cleanup();
+      reject(rpcErr(ERR.NAV_TIMEOUT, `Tab did not reach "${until}" within ${timeoutMs}ms`, true));
+    }, timeoutMs);
+  });
 }
 
 // ============================================================================
@@ -1326,9 +1456,13 @@ async function hBrowserState(args) {
     activeTabId: activeTabId ?? null,
     activeWindowId: activeWindowId ?? null,
     connected: true,
-    transport: isOpen(ws) ? "websocket" : nativePort ? "native" : "offline",
+    transport: isOpen(ws) ? "websocket" : "offline",
     sessionId,
     extVersion: EXT_VERSION,
+    netCapture: netCapture ? { capturing: true, tabId: netCapture.tabId, elapsedMs: nowTs() - netCapture.startedAt, count: netCapture.entries.length } : { capturing: false },
+    dbgTabs: dbgTabs.size,
+    injectedScripts: injectedScripts.size,
+    outbox: outbox.length,
   });
 }
 
@@ -1410,11 +1544,30 @@ async function hNavGoto(args) {
   const url = assertSafeNavUrl(optStr(args, "url"));
   await getTabOrThrow(tabId); // early, clean TAB_NOT_FOUND
   const startedAt = nowTs();
+  // P0.2 viewport/background — before navigating, optionally resize window
+  const width = Number.isFinite(args.width) ? Math.round(args.width) : null;
+  const height = Number.isFinite(args.height) ? Math.round(args.height) : null;
+  const background = !!args.background;
+  if (width != null && height != null) {
+    try {
+      const tab = await getTabOrThrow(tabId);
+      if (tab.windowId != null) {
+        await cbp(chrome.windows.update.bind(chrome.windows), tab.windowId, { width, height }).catch(() => {});
+      }
+    } catch { /* ignore resize */ }
+  }
   await cbp(chrome.tabs.update.bind(chrome.tabs), tabId, { url }).catch((e) => { throw mapChromeError(e); });
   const until = normUntil(args ? args.waitUntil : undefined);
   const timeoutMs = optNum(args, "timeoutMs", DEFAULT_OP_TIMEOUT_MS, 1000, 300_000);
   const settled = await waitTabSettled(tabId, until, timeoutMs);
-  return ok({ ...settled, requestedUrl: url, until, elapsedMs: nowTs() - startedAt });
+  // background:true means don't focus window after navigation
+  if (!background) {
+    try {
+      const tab = await getTabOrThrow(tabId);
+      if (tab.windowId != null) await cbp(chrome.windows.update.bind(chrome.windows), tab.windowId, { focused: true }).catch(() => {});
+    } catch {}
+  }
+  return ok({ ...settled, requestedUrl: url, until, elapsedMs: nowTs() - startedAt, width, height, background });
 }
 
 async function hNavWaitReady(args) {
@@ -1434,29 +1587,52 @@ async function hCsEval(args) {
   if (!source) throw rpcErr(ERR.BAD_REQUEST, 'cs.eval requires "func" (function/arrow source string)');
   const tab = await getTabOrThrow(tabId);
   assertInjectableTab(tab);
-  const world = "MAIN"; // Must use MAIN world — MV3 default CSP blocks new Function() in ISOLATED
+  // Default ISOLATED to bypass page CSP (X, Instagram, etc.). MAIN only when explicitly requested
+  // and even then we avoid new Function string eval where possible.
+  const world = args.world === "MAIN" ? "MAIN" : "ISOLATED";
   const callArgs = JSON.stringify(Array.isArray(args.args) ? args.args : []);
   const allFrames = !!(args && args.allFrames);
 
-  // Minimal eval function — Chrome handles async natively via executeScript.
-  // No wrapping, no try/catch inside: errors propagate as script errors.
   const evalFn = (src, argsJson) => {
     const argv = JSON.parse(argsJson);
-    let fn;
-    try { fn = new Function('return (' + src + ')')(); } catch { fn = undefined; }
-    if (typeof fn !== 'function') {
-      try { fn = new Function('return (function (...a) { ' + src + ' })')(); }
-      catch (e) { return { __mcpError: String(e).slice(0, 200) }; }
+    let fn = _evalFnCache.get(src);
+    if (!fn) {
+      try { fn = new Function('return (' + src + ')')(); } catch { fn = undefined; }
+      if (typeof fn !== 'function') {
+        try { fn = new Function('return (function (...a) { ' + src + ' })')(); }
+        catch (e) { return { __mcpError: String(e).slice(0, 300) }; }
+      }
+      if (_evalFnCache.size > 100) { const k = _evalFnCache.keys().next().value; _evalFnCache.delete(k); }
+      _evalFnCache.set(src, fn);
     }
-    return fn.apply(null, argv);
+    try {
+      const r = fn.apply(null, argv);
+      return r instanceof Promise ? r : r;
+    } catch (e) { return { __mcpError: String(e && e.message || e).slice(0, 300) }; }
   };
 
-  const results = await chrome.scripting.executeScript({
-    target: { tabId, allFrames },
-    world,
-    func: evalFn,
-    args: [source, callArgs],
-  }).catch((e) => { throw mapChromeError(e); });
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames },
+      world,
+      func: evalFn,
+      args: [source, callArgs],
+    }).catch((e) => { throw mapChromeError(e); });
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    // CSP blocked in MAIN (X, Instagram) — retry in ISOLATED which bypasses page CSP
+    if (/Content Security Policy|unsafe-eval/i.test(msg) && world === "MAIN") {
+      try {
+        results = await chrome.scripting.executeScript({
+          target: { tabId, allFrames },
+          world: "ISOLATED",
+          func: evalFn,
+          args: [source, callArgs],
+        }).catch((e2) => { throw mapChromeError(e2); });
+      } catch (e2) { throw e; }
+    } else { throw e; }
+  }
 
   const frames = (results || []).map((r) => {
     if (r && r.error) return { frameId: r.frameId, error: String(r.error).slice(0, 300) };
@@ -1617,7 +1793,7 @@ const FORBIDDEN_HEADERS = new Set([
 ]);
 
 async function hHttpRequest(args) {
-  const url = assertSafeFetchUrl(optStr(args, "url"));
+  const initialUrl = assertSafeFetchUrl(optStr(args, "url"));
   const method = (typeof args.method === "string" ? args.method : "GET").toUpperCase();
   if (!["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].includes(method)) {
     throw rpcErr(ERR.BAD_REQUEST, `http.request method "${method}" not allowed`);
@@ -1629,10 +1805,12 @@ async function hHttpRequest(args) {
   const skippedHeaders = [];
   for (const [k, v] of Object.entries(headersIn)) {
     const lk = String(k).toLowerCase();
+    if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(String(v))) { skippedHeaders.push(String(k)); continue; }
     if (FORBIDDEN_HEADERS.has(lk) || typeof v !== "string") {
       skippedHeaders.push(String(k));
       continue;
     }
+    if (/^(host|x-forwarded-host)$/i.test(k)) { skippedHeaders.push(String(k)); continue; }
     headers[String(k)] = v;
   }
   let body;
@@ -1646,43 +1824,89 @@ async function hHttpRequest(args) {
         headers["Content-Type"] = "application/json";
       }
     }
+    if (body && body.length > MAX_HTTP_BODY_CHARS) throw rpcErr(ERR.BAD_REQUEST, `body too large (${body.length} > ${MAX_HTTP_BODY_CHARS})`);
   }
   const timeoutMs = optNum(args, "timeoutMs", DEFAULT_OP_TIMEOUT_MS, 1000, 300_000);
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method,
-      headers,
-      body,
-      credentials: "include", // ride the browser profile's cookies
-      redirect: "follow",
-      signal: ctl.signal,
-    });
-    const text = await res.text();
-    const truncated = text.length > MAX_HTTP_BODY_CHARS;
-    const resHeaders = {};
-    res.headers.forEach((v, k) => { resHeaders[k] = v; });
-    return ok({
-      status: res.status,
-      statusText: res.statusText,
-      ok: res.ok,
-      url: res.url,
-      redirected: res.redirected,
-      headers: resHeaders,
-      body: truncated ? text.slice(0, MAX_HTTP_BODY_CHARS) : text,
-      truncated,
-      byteLength: text.length,
-      skippedHeaders,
-    });
-  } catch (e) {
-    if (ctl.signal.aborted) {
-      throw rpcErr(ERR.TIMEOUT, `http.request timed out after ${timeoutMs}ms`, true);
+  let curUrl = initialUrl;
+  let fetchRes = null;
+  let redirects = 0;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const res = await fetch(curUrl, {
+        method: attempt === 0 ? method : "GET",
+        headers,
+        body: attempt === 0 ? body : undefined,
+        credentials: "include",
+        redirect: "manual",
+        signal: ctl.signal,
+      });
+      clearTimeout(timer);
+      if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+        const loc = res.headers.get("location");
+        if (!loc) { fetchRes = res; break; }
+        let nextUrl;
+        try { nextUrl = new URL(loc, curUrl).href; } catch { throw rpcErr(ERR.RESTRICTED_URL, `Invalid redirect location: ${loc}`); }
+        assertSafeFetchUrl(nextUrl);
+        if (isBlockedInternalUrl(nextUrl)) throw rpcErr(ERR.RESTRICTED_URL, `Redirect to blocked host: ${nextUrl}`);
+        curUrl = nextUrl;
+        redirects++;
+        if (redirects > 5) throw rpcErr(ERR.RESTRICTED_URL, "Too many redirects");
+        continue;
+      }
+      // also catch fetch's automatic redirect already followed - re-validate final url
+      if (res.url && isBlockedInternalUrl(res.url)) throw rpcErr(ERR.RESTRICTED_URL, `Redirected to blocked host: ${res.url}`);
+      fetchRes = res;
+      break;
+    } catch (e) {
+      clearTimeout(timer);
+      if (e instanceof RpcError) throw e;
+      if (e && e.name === "AbortError") throw rpcErr(ERR.TIMEOUT, `http.request timed out after ${timeoutMs}ms`, true);
+      if (String(e?.message || "").includes("aborted")) throw rpcErr(ERR.TIMEOUT, `http.request timed out after ${timeoutMs}ms`, true);
+      throw rpcErr(ERR.HTTP_ERROR, String((e && e.message) || e), true);
     }
-    throw rpcErr(ERR.HTTP_ERROR, String((e && e.message) || e), true);
-  } finally {
-    clearTimeout(timer);
   }
+  if (!fetchRes) throw rpcErr(ERR.HTTP_ERROR, "No response from fetch", true);
+  const res = fetchRes;
+  // streaming read with cap to avoid OOM
+  let text = "";
+  let truncated = false;
+  try {
+    if (res.body && typeof res.body.getReader === "function") {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+        if (text.length > MAX_HTTP_BODY_CHARS) { truncated = true; text = text.slice(0, MAX_HTTP_BODY_CHARS); try { await reader.cancel(); } catch {} break; }
+      }
+      if (!truncated) text += decoder.decode();
+    } else {
+      const raw = await res.text();
+      truncated = raw.length > MAX_HTTP_BODY_CHARS;
+      text = truncated ? raw.slice(0, MAX_HTTP_BODY_CHARS) : raw;
+    }
+  } catch (e) {
+    throw rpcErr(ERR.HTTP_ERROR, String((e && e.message) || e), true);
+  }
+  // final url check after reading
+  if (res.url && isBlockedInternalUrl(res.url)) throw rpcErr(ERR.RESTRICTED_URL, `Blocked redirect target: ${res.url}`);
+  const resHeaders = {};
+  res.headers.forEach((v, k) => { resHeaders[k] = v; });
+  return ok({
+    status: res.status,
+    statusText: res.statusText,
+    ok: res.ok,
+    url: res.url || curUrl,
+    redirected: redirects > 0 || res.redirected,
+    headers: resHeaders,
+    body: text,
+    truncated,
+    byteLength: text.length,
+    skippedHeaders,
+  });
 }
 
 // ---- Cookies ------------------------------------------------------------------------------
@@ -1783,6 +2007,80 @@ async function hInjectedSend(args) {
   return ok({ name, data: out ? (out.detail ?? null) : null });
 }
 
+// ---- Content-script exec (CSP-safe) -------------------------------------------------------
+
+async function hContentExec(args) {
+  const tabId = reqNum(args, "tabId");
+  const op = optStr(args, "op");
+  if (!op) throw rpcErr(ERR.BAD_REQUEST, 'content.exec requires "op"');
+  const tab = await getTabOrThrow(tabId);
+  assertInjectableTab(tab);
+  const opArgs = args.args && typeof args.args === "object" ? args.args : {};
+  try {
+    const resp = await chrome.tabs.sendMessage(tabId, { op, args: opArgs });
+    if (resp && resp.ok) return ok(resp.result);
+    if (resp && resp.error) throw rpcErr(ERR.EVAL_FAILED, String(resp.error.message || resp.error).slice(0, 400));
+    throw rpcErr(ERR.EVAL_FAILED, `content op "${op}" failed: no response (content script not injected?)`);
+  } catch (e) {
+    if (e instanceof RpcError) throw e;
+    throw mapChromeError(e);
+  }
+}
+
+// ---- Dialog — ported from mcp-chrome MIT app/chrome-extension/entrypoints/background/tools/browser/dialog.ts
+// Handles JS alert/confirm/prompt via CDP Page.handleJavaScriptDialog
+
+async function hDialogHandle(args) {
+  const action = String(args.action || "").toLowerCase();
+  if (action !== "accept" && action !== "dismiss") throw rpcErr(ERR.BAD_REQUEST, 'dialog.handle action must be "accept" or "dismiss"');
+  const promptText = typeof args.promptText === "string" ? args.promptText : undefined;
+  // Find active tab if tabId not supplied
+  let tabId = Number.isFinite(args.tabId) ? Math.floor(args.tabId) : null;
+  if (tabId == null) {
+    const tabs = await cbp(chrome.tabs.query.bind(chrome.tabs), { active: true, currentWindow: true }).catch(() => []);
+    tabId = tabs?.[0]?.id ?? null;
+    if (tabId == null) throw rpcErr(ERR.TAB_NOT_FOUND, "No active tab for dialog.handle");
+  }
+  await getTabOrThrow(tabId);
+  await withDebugger(tabId, async (t) => {
+    try { await cdpSend(t, "Page.enable", {}); } catch {}
+    await cdpSend(t, "Page.handleJavaScriptDialog", { accept: action === "accept", promptText: action === "accept" ? promptText : undefined });
+  });
+  return ok({ handled: true, action, promptText: promptText ?? null, tabId });
+}
+
+// ---- Download wait — ported from mcp-chrome MIT app/chrome-extension/entrypoints/background/tools/browser/download.ts
+
+async function hDownloadWait(args) {
+  const filenameContains = typeof args.filenameContains === "string" ? args.filenameContains.trim() : "";
+  const timeoutMs = optNum(args, "timeoutMs", optNum(args, "timeout_ms", 60_000, 1000, 300_000), 1000, 300_000);
+  if (typeof chrome.downloads === "undefined") throw rpcErr(ERR.INTERNAL, "chrome.downloads API unavailable (missing downloads permission?)");
+  const start = nowTs();
+  const deadline = start + timeoutMs;
+  // Helper to check if item matches
+  const matches = (item) => {
+    if (!filenameContains) return true;
+    const base = (item.filename || "").split(/[/\\]/).pop() || "";
+    return base.includes(filenameContains) || (item.url || "").includes(filenameContains);
+  };
+  // Poll chrome.downloads.search until match completes or timeout
+  for (;;) {
+    const remaining = deadline - nowTs();
+    if (remaining <= 0) throw rpcErr(ERR.TIMEOUT, `download.wait timed out after ${timeoutMs}ms${filenameContains ? ` (filenameContains="${filenameContains}")` : ""}`, true);
+    try {
+      const items = await cbp(chrome.downloads.search.bind(chrome.downloads), {}).catch(() => []);
+      const hit = (items || []).filter(matches).sort((a, b) => (b.startTime ? Date.parse(b.startTime) : 0) - (a.startTime ? Date.parse(a.startTime) : 0))[0];
+      if (hit && hit.state === "complete") {
+        return ok({ found: true, id: hit.id, filename: hit.filename, url: hit.url, state: hit.state, fileSize: hit.fileSize ?? hit.totalBytes ?? null, elapsedMs: nowTs() - start });
+      }
+      if (hit && hit.state === "interrupted") throw rpcErr(ERR.INTERNAL, `Download interrupted: ${hit.filename || hit.url}`);
+    } catch (e) {
+      if (e instanceof RpcError) throw e;
+    }
+    await sleep(Math.min(500, remaining));
+  }
+}
+
 // ---- CAPTCHA wait ---------------------------------------------------------------------------
 
 async function hCaptchaWait(args) {
@@ -1828,8 +2126,108 @@ async function init() {
   loadInjectedRegistry();
   primeBrowserState().catch((e) => log("state priming failed:", e?.message || e));
   connectLoop();
-  maybeStartNative();
   log(`background ready (v${EXT_VERSION})`);
 }
+
+// ---------------------------------------------------------------------------
+// §15.1 UI messaging — popup / dashboard / options page
+// ---------------------------------------------------------------------------
+
+function uiStatus() {
+  // wsReady → connected, else waiting/reconnecting — never hard-error when just waiting for server
+  let status = "waiting";
+  if (wsReady && isOpen(ws)) status = "connected";
+  else if (reconnectTimer || connectInFlight) status = "waiting";
+  // transient "connect-failed" / "welcome-timeout" are not real errors — just waiting for server to start
+  const transient = /^(connect-failed|welcome-timeout|socket down:)/i;
+  const err = transient.test(lastErrorText) ? "" : lastErrorText;
+  return {
+    ok: true,
+    status,
+    transport: isOpen(ws) ? "websocket" : "offline",
+    error: err,
+    extVersion: EXT_VERSION,
+    serverUrl: settingsCache.serverUrl || DEFAULT_SERVER_URL,
+    wsReady,
+    reconnectAttempts,
+  };
+}
+
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === "install") {
+    const url = chrome.runtime.getURL("dashboard.html#welcome");
+    chrome.tabs.create({ url }).catch(() => {});
+  }
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  (async () => {
+    try {
+      if (!msg || typeof msg.type !== "string") return;
+      switch (msg.type) {
+        case "getStatus": {
+          sendResponse(uiStatus());
+          break;
+        }
+        case "reconnect": {
+          lastErrorText = "";
+          teardownSocket("ui-reconnect");
+          scheduleReconnect({ immediate: true });
+          sendResponse({ ok: true });
+          break;
+        }
+        case "getBrowserState": {
+          const wins = await chrome.windows.getAll({ populate: true });
+          const tabs = await chrome.tabs.query({});
+          const activeTab = tabs.find(t=>t.active) || null;
+          sendResponse({ ok: true, state: { windows: wins.map(winInfo), tabs: tabs.map(tabInfo), activeTabId: activeTab?.id||null, windowCount: wins.length, tabCount: tabs.length } });
+          break;
+        }
+        case "getTabs": {
+          const tabs = await chrome.tabs.query({});
+          const wins = await chrome.windows.getAll({ populate: true });
+          sendResponse({ ok: true, tabs: tabs.map(tabInfo), windows: wins.map(winInfo) });
+          break;
+        }
+        case "openDashboard": {
+          const url = chrome.runtime.getURL("dashboard.html");
+          const tab = await chrome.tabs.create({ url });
+          sendResponse({ ok: true, tabId: tab.id });
+          break;
+        }
+        case "updateSettings": {
+          const patch = {};
+          if (typeof msg.serverUrl === "string" && msg.serverUrl) {
+            const v = msg.serverUrl.trim();
+            assertSafeWsUrl(v);
+            patch.serverUrl = v;
+          }
+          if (typeof msg.wsUrl === "string" && msg.wsUrl) {
+            const v = msg.wsUrl.trim();
+            assertSafeWsUrl(v);
+            patch.serverUrl = v;
+          }
+          if (Object.keys(patch).length) await setSettings(patch);
+          sendResponse({ ok: true, settings: settingsCache });
+          break;
+        }
+        case "getSettings": {
+          await loadSettings();
+          sendResponse({
+            ok: true,
+            serverUrl: settingsCache.serverUrl,
+            wsUrl: settingsCache.serverUrl,
+          });
+          break;
+        }
+        default:
+          break;
+      }
+    } catch (e) {
+      try { sendResponse({ ok: false, error: String(e?.message || e) }); } catch {}
+    }
+  })();
+  return true; // keep sendResponse alive for async
+});
 
 init();

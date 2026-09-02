@@ -1,29 +1,30 @@
 # Browser Navigator MCP
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that gives AI assistants full control over the **Brave browser** (and other Chromium browsers) through the Chrome DevTools Protocol (CDP).
+A [Model Context Protocol](https://modelcontextprotocol.io) server that gives AI assistants full control over **Brave / Chrome** via a **Manifest V3 extension** (no external browser download).
 
-It attaches to your **existing** Brave instance — or launches a fresh one — and drives the real browser: tabs, windows, clicks, typing, screenshots, PDFs, sessions, and even HTML5 video playback.
+The extension (`extension/background.js` service worker + `content.js` DOM ops) bridges to the local MCP server over **WebSocket `ws://127.0.0.1:9224`** (native-messaging fallback). The server speaks MCP over `stdio` and drives the *real* user profile — tabs, windows, clicks, typing, screenshots, PDFs, cookies, video — through `chrome.tabs`, `chrome.windows`, `chrome.scripting` and `chrome.debugger`.
 
-Built so that an LLM can operate **complex, dynamic UIs** (dialogs, modals, dropdowns, token chips, custom widgets) without needing to reverse-engineer the DOM by hand.
+Built so that an LLM can operate **complex, dynamic UIs** (dialogs, modals, dropdowns, token chips) without reverse-engineering the DOM: `list_elements` + `inspect_dom` + `focus_element` + `press_key` + `scope`.
 
 ## Highlights
 
-- 🧭 **Full browser control** — navigate, back/forward, click, type, scroll, hover, keyboard input
-- 🗂 **Adaptive DOM tools** — `list_elements`, `inspect_dom`, `focus_element`, `press_key` discover how a UI is built and interact with it (see [Working with complex UIs](#working-with-complex-uis))
-- 🪟 **Window & tab management** — list, open, switch, and close windows and tabs
-- 🔐 **CAPTCHA detection** — detects reCAPTCHA, hCaptcha, Cloudflare Turnstile & challenges, pauses automation, and waits for a human to solve it
-- 🍪 **Session persistence** — save/load cookies to keep logins alive between runs
-- 🎥 **Video control** — play/pause/seek/volume/fullscreen on any HTML5 player
-- 🔍 **Social search** — one-tool searches across Google, X, Instagram, Facebook, LinkedIn, TikTok, YouTube
-- 📄 **Export** — full-page screenshots and PDF archiving
-- 🔧 **Arbitrary JS** — `execute_js` for anything else (requires an explicit `confirm=true`)
-- 🏥 **Health check** — server + browser connection state, open window/tab counts
+- 🧭 **Full browser control** — navigate, back/forward, click, type, scroll, hover, keyboard input (extension `cs.eval` + `debugger` Input)
+- 🗂 **Adaptive DOM tools** — `list_elements`, `inspect_dom`, `focus_element`, `press_key` discover how a UI is built and interact with it
+- 🪟 **Window & tab management** — list, open, switch, and close windows and tabs (`chrome.tabs/windows`)
+- 🔐 **CAPTCHA detection** — detects reCAPTCHA, hCaptcha, Cloudflare Turnstile & challenges, pauses automation, and waits for a human
+- 🍪 **Session persistence** — save/load cookies via `chrome.cookies` (encrypted), `data/` JSON stores
+- 🎥 **Video control** — play/pause/seek/volume/mute on any HTML5 player
+- 🔍 **Social search** — `search` + `search_tabs` (TF‑IDF) across 9 platforms
+- 📄 **Export** — screenshots (`Page.captureScreenshot` + `captureVisibleTab`) and PDF (`Page.printToPDF`) to `data/screenshots/`
+- 🔧 **Arbitrary JS** — `execute_js` (wrapped `async () => (code)`, requires `confirm=true`)
+- 🏥 **Health check** — server + extension transport state (`waiting`/`connected`), window/tab counts
+- 🧩 **UI** — toolbar `popup.html` (380px) + full `dashboard.html` (overview/browser/tools/captures/settings/logs), `manifest.json` `options_page` → dashboard
 
 ## Requirements
 
 - **Node.js 20+**
-- **Brave browser** (or any Chromium browser; the server auto-launches Brave from standard install paths)
-- No Playwright browser download needed — the server drives the real browser over CDP
+- **Brave / Chrome 118+** with extension loaded (see below)
+- No Playwright — extension does DOM/debugger work; server is `ws` + `zod` + `@modelcontextprotocol/sdk`
 
 ## Installation
 
@@ -35,24 +36,23 @@ npm install
 
 ## Quick Start
 
-### 1. Launch Brave with the debug port
+### 1. Load the extension
+
+`brave://extensions` → Developer mode → **Load unpacked** → select `extension/` (or `brave-browser --load-extension=/abs/path/extension --remote-debugging-port=9222`). The toolbar shows **Browser Navigator** with popup (`popup.html`) and full dashboard (`dashboard.html` via `chrome.runtime.getURL("dashboard.html")`).
+
+The extension auto-connects to `ws://127.0.0.1:9224` and shows `Waiting for MCP server…` (yellow) until the server is up, then `Connected`.
+
+### 2. Run the server (provides the WS counterpart)
 
 ```bash
-./launch-brave.sh
+npm install
+node index.js              # stdio MCP + ws://127.0.0.1:9224
+# or ./start.sh (launches Brave with --remote-debugging-port=9222 if needed, then node)
 ```
 
-This starts Brave with `--remote-debugging-port=9222`. It **never kills** an existing Brave instance — if the port is already in use it leaves it alone.
+The server speaks MCP over `stdio`. `connect_brave` wires the current tab (`health` shows `connected:true`) and `navigate` etc. go through the extension.
 
-> Alternatively, start Brave manually: `brave --remote-debugging-port=9222`.
-> If Brave is already running **without** a debug port, the MCP asks you to close it and retry — it will not kill your running browser for you.
-
-### 2. Run the server
-
-```bash
-node index.js
-```
-
-The server speaks MCP over stdio. `connect_brave` attaches to the running Brave instance automatically.
+> Still uses `--remote-debugging-port=9222` only for `launch-brave.sh` / `start.sh` to ensure Brave is running with a debuggable profile; the *control path* is now extension → WS, not direct CDP from Node.
 
 ### 3. Register it as an MCP server
 
@@ -94,7 +94,7 @@ click "Learn more"
 
 ## Tools
 
-All 27 tools:
+All 40+ tools (via `tools.js:1` → `bridge.js` → `background.js` ops):
 
 | Tool | Description |
 |------|-------------|
@@ -131,7 +131,7 @@ All 27 tools:
 | `detect_captcha` | Check CAPTCHA presence & solved status |
 | `wait_for_captcha` | Poll until the user solves a CAPTCHA |
 | `video_control` | Play/pause/seek/volume/fullscreen on HTML5 video |
-| `search` | Search 17 platforms: Google, Bing, DuckDuckGo, Yahoo, Brave, Yandex, Perplexity, Twitter/X, Instagram, Facebook, LinkedIn, TikTok, Reddit, YouTube, GitHub, Stack Overflow, Wikipedia |
+| `search` | Search 9 platforms: Google, Bing, DuckDuckGo, Brave, YouTube, Reddit, GitHub, Stack Overflow, Wikipedia |
 | `bookmark_add` / `bookmark_delete` / `bookmark_search` / `bookmark_list` | Local bookmark store with Chrome/Brave import |
 | `history_search` | Search browsing history (time-filtered, persisted) |
 | `cookies` | Save/load session cookies (stored under `cookies/`) |

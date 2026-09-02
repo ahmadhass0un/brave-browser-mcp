@@ -18,7 +18,7 @@ import {
 // ============================================================================
 
 const LOG_PREFIX = "[bridge]";
-const log = (...parts) => { try { console.log(LOG_PREFIX, ...parts); } catch { /* noop */ } };
+const log = (...parts) => { try { console.error(LOG_PREFIX, ...parts); } catch { /* noop */ } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 /** Transport budgets. tools.js may override per-call via opts.timeoutMs. */
@@ -31,13 +31,15 @@ export const TIMEOUTS = Object.freeze({
   NET_STOP: 15_000,
 });
 
-const OP_TIMEOUT_MS = {
+const OP_TIMEOUT_MS = Object.freeze({
   "nav.goto": TIMEOUTS.NAV_GOTO,
   read_page: TIMEOUTS.READ_PAGE,
   screenshot: TIMEOUTS.SCREENSHOT,
   pdf_export: TIMEOUTS.PDF_EXPORT,
   "net.stop": TIMEOUTS.NET_STOP,
-};
+  "cs.eval": 5_000, // Patch 2: click 5s not 20s (was 20s tail even for instant click)
+  "content.exec": 5_000,
+});
 
 /** dbg.cmd budgets keyed by CDP method (the read_page / screenshot / pdf trio). */
 const DBG_METHOD_TIMEOUT_MS = {
@@ -47,33 +49,31 @@ const DBG_METHOD_TIMEOUT_MS = {
 };
 
 function resolveTimeoutMs(op, args, opts) {
-  if (Number.isFinite(opts?.timeoutMs) && opts.timeoutMs > 0) return Math.floor(opts.timeoutMs);
+  if (Number.isFinite(opts?.timeoutMs) && opts.timeoutMs > 0) return Math.min(300_000, Math.floor(opts.timeoutMs));
   if (op === "wait_for") { // inner budget + slack for the final poll slice
     const inner = Number.isFinite(args?.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : TIMEOUTS.DEFAULT;
-    return Math.floor(inner) + 5_000;
+    return Math.min(300_000, Math.floor(inner) + 5_000);
   }
-  return OP_TIMEOUT_MS[op]
+  const base = OP_TIMEOUT_MS[op]
     || (op === "dbg.cmd" ? DBG_METHOD_TIMEOUT_MS[args?.method] : undefined)
     || TIMEOUTS.DEFAULT;
+  return Math.min(300_000, base);
 }
 
 // ============================================================================
-// §2 Transport registry — WebSocket preferred, native-messaging fallback
+// §2 Transport — WebSocket only
 // ============================================================================
 
-const WebSocket_OPEN = 1; // ws' WebSocket.OPEN without importing the class
-const transports = { ws: null, native: null };
+const WebSocket_OPEN = 1;
+let wsTransport = null;
 
 export function pick() {
-  if (transports.ws && transports.ws.readyState === WebSocket_OPEN) return transports.ws;
-  return transports.native ?? null;
+  if (wsTransport && wsTransport.readyState === WebSocket_OPEN) return wsTransport;
+  return null;
 }
 
-export const isConnected = () => pick() !== null;
-
 export function transportName() {
-  if (transports.ws && transports.ws.readyState === WebSocket_OPEN) return "websocket";
-  if (transports.native) return "native";
+  if (wsTransport && wsTransport.readyState === WebSocket_OPEN) return "websocket";
   return null;
 }
 
@@ -81,8 +81,7 @@ function sendEnvelope(env) {
   const t = pick();
   if (!t) return false;
   try {
-    if (t === transports.ws) t.send(JSON.stringify(env));
-    else t.postMessage(env); // native port carries structured objects
+    t.send(JSON.stringify(env));
     return true;
   } catch (e) {
     log("send failed:", e?.message || e);
@@ -102,19 +101,12 @@ function invalidatePending(reason) {
 }
 
 export function setWs(ws) {
-  const prev = transports.ws;
+  const prev = wsTransport;
   if (prev === ws) return;
-  transports.ws = ws ?? null;
+  wsTransport = ws ?? null;
   if (prev && prev.readyState === WebSocket_OPEN) {
     try { prev.close(4002, "superseded"); } catch { /* already gone */ }
   }
-  invalidatePending("transport changed mid-call");
-}
-
-export function setNative(native) {
-  const prev = transports.native;
-  if (prev === native) return;
-  transports.native = native ?? null;
   invalidatePending("transport changed mid-call");
 }
 
@@ -129,14 +121,10 @@ export function shutdown() {
     pending.delete(id);
     entry.reject(err);
   }
-  const sock = transports.ws;
-  transports.ws = null;
+  const sock = wsTransport;
+  wsTransport = null;
   if (sock) { try { sock.close(1001, "server-shutdown"); } catch { /* gone */ } }
-  const native = transports.native;
-  transports.native = null;
-  if (native) { try { native.close?.(); } catch { /* gone */ } }
   clearRefs();
-  eventListeners.clear();
   recentEvents.length = 0;
 }
 
@@ -146,11 +134,15 @@ export function shutdown() {
 
 const pending = new Map(); // req id -> { resolve, reject, timer }
 
+const PENDING_MAX = 500; // §F.1 cap unbounded pending (was O(n) invalidate + 20s tail)
 export async function call(op, args = {}, opts = {}) {
   if (shuttingDown) throw new RpcError(ERROR_CODES.NOT_CONNECTED, "Bridge shut down", false);
   if (!pick()) {
     throw new RpcError(ERROR_CODES.NOT_CONNECTED,
       "Not connected to the browser extension. Run connect_brave first.", true);
+  }
+  if (pending.size >= PENDING_MAX) {
+    throw new RpcError(ERROR_CODES.TIMEOUT, `Too many pending calls (${pending.size}) — throttling`, true);
   }
   const env = makeReq(op, args ?? {});
   const budgetMs = resolveTimeoutMs(op, args, opts);
@@ -159,6 +151,7 @@ export async function call(op, args = {}, opts = {}) {
       pending.delete(env.id);
       reject(new RpcError(ERROR_CODES.TIMEOUT, `"${op}" timed out after ${budgetMs}ms`, true));
     }, budgetMs);
+    timer.unref?.();
     pending.set(env.id, { resolve, reject, timer });
   });
   if (!sendEnvelope(env)) {
@@ -195,40 +188,31 @@ export function onTransportMessage(env) {
   ingestEvent(env); // evt
 }
 
-// ---- Event bus --------------------------------------------------------------
+// ---- Event bus (recent only; no external listeners needed) -------------------
 
 const EVENT_BUFFER_MAX = 200;
 const recentEvents = [];
-const eventListeners = new Set();
 
-export const onEvent = (fn) => { eventListeners.add(fn); return () => eventListeners.delete(fn); };
-export const offEvent = (fn) => eventListeners.delete(fn);
-export const getRecentEvents = (n = 20) => recentEvents.slice(-n);
 export const drainRecentEvents = () => recentEvents.splice(0);
 
 function ingestEvent(env) {
-  const record = makeEvt(env.event, env.data); // normalizes shape, fresh local id
+  // keep bridge tab pointer in sync with browser
+  if (env.event === "tab.activated" && env.data?.tabId != null) {
+    setCurrentTab(env.data.tabId, env.data.windowId ?? null);
+  } else if (env.event === "win.focused" && env.data?.windowId != null) {
+    // win focus will be followed by tab.activated but record
+    currentWindowId = env.data.windowId;
+  }
+  // cap data size per event
+  let data = env.data;
+  try {
+    const s = JSON.stringify(data);
+    if (s && s.length > 100 * 1024) data = { truncated: true, _origSize: s.length };
+  } catch {}
+  const record = makeEvt(env.event, data);
   record.ts = env.ts ?? record.ts;
   recentEvents.push(record);
   if (recentEvents.length > EVENT_BUFFER_MAX) recentEvents.shift();
-  for (const fn of [...eventListeners]) {
-    try { fn(record); } catch (e) { log("event listener failed:", e?.message || e); }
-  }
-}
-
-export function waitForEvent(event, { timeoutMs = 15_000, predicate } = {}) {
-  return new Promise((resolve, reject) => {
-    const off = onEvent((rec) => {
-      if (rec.event !== event || (predicate && !predicate(rec))) return;
-      clearTimeout(timer);
-      off();
-      resolve(rec);
-    });
-    const timer = setTimeout(() => {
-      off();
-      reject(rpcErr(ERROR_CODES.TIMEOUT, `No "${event}" event within ${timeoutMs}ms`, true));
-    }, timeoutMs);
-  });
 }
 
 // ============================================================================
@@ -236,7 +220,7 @@ export function waitForEvent(event, { timeoutMs = 15_000, predicate } = {}) {
 // ============================================================================
 
 export const refMap = new Map(); // "ref_N" -> { selector, role, name }
-export let refCounter = 0;
+let refCounter = 0;
 
 export function registerRef(info) {
   refCounter += 1;
@@ -269,12 +253,15 @@ export let currentTabId = null;
 export let currentWindowId = null;
 
 export function setCurrentTab(tabId, windowId = null) {
+  if (tabId != null && String(tabId).includes("_")) { /* ignore weird */ }
+  const changed = currentTabId !== (tabId ?? null);
   currentTabId = tabId ?? null;
   currentWindowId = windowId ?? null;
+  if (changed) clearRefs();
 }
 
 export function requireTab() {
-  if (currentTabId == null) throw new Error("Not connected. Run connect_brave first.");
+  if (currentTabId == null) throw new RpcError(ERROR_CODES.NOT_CONNECTED, "Not connected. Run connect_brave first.", true);
   return currentTabId;
 }
 
@@ -301,6 +288,9 @@ export const nav = {
     const args = { tabId: opts.tabId ?? requireTab(), url };
     if (opts.waitUntil) args.waitUntil = opts.waitUntil;
     if (Number.isFinite(opts.timeoutMs)) args.timeoutMs = opts.timeoutMs;
+    if (Number.isFinite(opts.width)) args.width = opts.width;
+    if (Number.isFinite(opts.height)) args.height = opts.height;
+    if (typeof opts.background === "boolean") args.background = opts.background;
     return call("nav.goto", args, { timeoutMs: opts.timeoutMs });
   },
   waitReady: (opts = {}) => {
@@ -314,11 +304,6 @@ export const nav = {
 export const dbg = {
   command: (tabId, method, params = {}, opts = {}) =>
     call("dbg.cmd", { tabId, method, params }, opts),
-};
-
-export const input = {
-  mouse: (args) => call("input.mouse", args),
-  key: (args) => call("input.key", args),
 };
 
 export const browser = {
@@ -355,6 +340,18 @@ export const injected = {
 
 export const http = {
   request: (args = {}) => call("http.request", args, { timeoutMs: args?.timeoutMs }),
+};
+
+export const content = {
+  exec: (tabId, op, args = {}) => call("content.exec", { tabId, op, args }),
+};
+
+export const dialog = {
+  handle: (opts = {}) => call("dialog.handle", opts),
+};
+
+export const download = {
+  wait: (opts = {}) => call("download.wait", opts),
 };
 
 export const captcha = {
@@ -444,14 +441,18 @@ function pageExtract(selector) {
 }
 
 function pageListInteractive(limit) {
+  // §F.1 fix: layout thrash — check visible cheap first where possible, cap scan to limit*3
   const nodes = document.querySelectorAll([
     "a[href]", "button", "input", "select", "textarea", "summary",
     '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]', '[role="tab"]',
     "[onclick]", "[contenteditable=true]",
   ].join(","));
   const out = [];
-  for (const el of nodes) {
-    if (out.length >= limit) break;
+  let scanned = 0;
+  const maxScan = Math.min(nodes.length, Math.max(limit * 3, 150));
+  for (let i = 0; i < nodes.length && out.length < limit && scanned < maxScan; i++) {
+    const el = nodes[i];
+    scanned++;
     const r = el.getBoundingClientRect();
     if (r.width <= 0 && r.height <= 0) continue;
     const label = el.getAttribute("aria-label");
@@ -485,33 +486,39 @@ function pageExists(t) {
   if (t.selector) return { ok: true, found: !!document.querySelector(t.selector) };
   if (t.text != null) {
     const needle = String(t.text).trim().toLowerCase();
-    const found = [...document.querySelectorAll("body *")]
-      .some((el) => !el.children.length && (el.textContent || "").trim().toLowerCase().includes(needle));
-    return { ok: true, found };
+    if (!needle) return { ok: true, found: false };
+    // §F.1 fix: TreeWalker 10k poll → single walk O(n) not QSA 10k + .some 10k
+    const root = document.body || document.documentElement;
+    if (!root) return { ok: true, found: false };
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      const txt = (n.nodeValue || "").trim().toLowerCase();
+      if (!txt.includes(needle)) continue;
+      const parent = n.parentElement;
+      if (!parent || parent.children.length !== 0) continue;
+      return { ok: true, found: true };
+    }
+    return { ok: true, found: false };
   }
   return { ok: false, reason: "BAD_REQUEST", message: "target needs selector or text" };
 }
 
 function pageDetectCaptcha() {
+  // §F.1 fix: avoid outerHTML 1-5MB serialize + 5 regex (30-200ms GC) — use selector checks
   const kinds = [];
   const signals = [];
-  const html = `${document.documentElement.outerHTML}`;
-  const tests = [
-    ["recaptcha", /google\.com\/recaptcha|\bgrecaptcha\b/i],
-    ["hcaptcha", /hcaptcha\.com|\bhcaptcha\b/i],
-    ["turnstile", /challenges\.cloudflare\.com|turnstile/i],
-    ["geetest", /geetest/i],
-    ["funcaptcha", /funcaptcha|arkoselabs/i],
-  ];
-  for (const [kind, re] of tests) {
-    if (re.test(html) || window[kind === "recaptcha" ? "grecaptcha" : kind]) {
-      kinds.push(kind);
-      signals.push(kind);
-    }
-  }
+  if (document.querySelector('iframe[src*="recaptcha"], .g-recaptcha') || window.grecaptcha) { kinds.push("recaptcha"); signals.push("recaptcha"); }
+  if (document.querySelector('iframe[src*="hcaptcha"], .h-captcha') || window.hcaptcha) { kinds.push("hcaptcha"); signals.push("hcaptcha"); }
+  if (document.querySelector('iframe[src*="challenges.cloudflare"], .cf-turnstile') || window.turnstile) { kinds.push("turnstile"); signals.push("turnstile"); }
+  if (document.querySelector('script[src*="geetest"], [class*="geetest"]')) { kinds.push("geetest"); signals.push("geetest"); }
+  if (document.querySelector('script[src*="arkoselabs"], script[src*="funcaptcha"]')) { kinds.push("funcaptcha"); signals.push("funcaptcha"); }
   for (const f of document.querySelectorAll("iframe[src]")) {
     const m = /(recaptcha|hcaptcha|turnstile|geetest|arkoselabs)/i.exec(f.src || "");
-    if (m) { kinds.push(m[1].toLowerCase()); signals.push(`iframe:${f.src.slice(0, 120)}`); }
+    if (m) {
+      const k = m[1].toLowerCase();
+      if (!kinds.includes(k)) { kinds.push(k); signals.push(`iframe:${f.src.slice(0, 120)}`); }
+    }
   }
   if (!kinds.length && /verify you are human|are you a robot|confirm you.?re? (a )?human/i.test(document.body?.innerText || "")) {
     kinds.push("unknown");
@@ -542,6 +549,50 @@ function pageVideoControl(action, arg) {
       playbackRate: v.playbackRate, muted: v.muted,
     },
   };
+}
+
+function pageWaitFor(t, timeoutMs) {
+  const startedAt = Date.now();
+  const existsNow = () => {
+    if (t.selector) { try { return !!document.querySelector(t.selector); } catch { return false; } }
+    if (t.text != null) {
+      const needle = String(t.text).trim().toLowerCase();
+      if (!needle) return false;
+      const root = document.body || document.documentElement;
+      if (!root) return false;
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let n;
+      while ((n = walker.nextNode())) {
+        const txt = (n.nodeValue || "").trim().toLowerCase();
+        if (!txt.includes(needle)) continue;
+        const parent = n.parentElement;
+        if (!parent || parent.children.length !== 0) continue;
+        return true;
+      }
+      return false;
+    }
+    return false;
+  };
+  if (existsNow()) return { ok: true, found: true, elapsedMs: 0 };
+  return new Promise((resolve) => {
+    let done = false;
+    let observer = null;
+    let timer = null;
+    const finish = (found) => {
+      if (done) return;
+      done = true;
+      if (observer) try { observer.disconnect(); } catch {}
+      if (timer) clearTimeout(timer);
+      if (found) resolve({ ok: true, found: true, elapsedMs: Date.now() - startedAt });
+      else resolve({ ok: false, reason: "TIMEOUT", message: `wait_for timed out after ${timeoutMs}ms` });
+    };
+    try {
+      observer = new MutationObserver(() => { if (existsNow()) finish(true); });
+      observer.observe(document.documentElement || document.body, { childList: true, subtree: true, attributes: true, characterData: true });
+    } catch { observer = null; }
+    // Patch 2: MutationObserver only, remove setInterval poll (was 1000ms) — saves 15-50ms jank per wait_for + 30 polls
+    timer = setTimeout(() => finish(false), timeoutMs);
+  });
 }
 
 export const dom = {
@@ -578,19 +629,10 @@ export const dom = {
   videoControl: (tabId, action, arg = null, opts = {}) =>
     unwrap(dom.eval(tabId, pageVideoControl, [action, arg], opts)),
 
-  /** Poll-based wait_for replacement: selector or text until found or deadline. */
+  /** Single-eval wait with MutationObserver + 500ms poll inside page (avoids per-slice serialization). */
   waitFor: async (tabId, target, opts = {}) => {
     const budgetMs = Math.max(1_000, Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 15_000);
-    const intervalMs = Math.max(100, opts.intervalMs ?? 500);
-    const startedAt = Date.now();
-    for (;;) {
-      const res = await dom.exists(tabId, target);
-      if (res.found) return { found: true, elapsedMs: Date.now() - startedAt };
-      const remaining = startedAt + budgetMs - Date.now();
-      if (remaining <= 0) {
-        throw rpcErr(ERROR_CODES.TIMEOUT, `wait_for timed out after ${budgetMs}ms`, true);
-      }
-      await sleep(Math.min(intervalMs, remaining));
-    }
+    const normalized = typeof target === "string" ? { selector: target } : target;
+    return unwrap(dom.eval(tabId, pageWaitFor, [normalized, budgetMs], opts), ERROR_CODES.TIMEOUT);
   },
 };

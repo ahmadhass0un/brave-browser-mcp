@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser Navigator</title>
+<link rel="icon" type="image/png" sizes="32x32" href="icons/icon32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="icons/icon16.png">
+<style>
+:root{color-scheme:dark;--bg:#202124;--card:#292a2d;--border:#3c4043;--fg:#e8eaed;--muted:#9aa0a6;--accent:#8ab4f8;--ok:#81c995;--warn:#fdd663;--err:#f28b82;--radius:10px}
+*{box-sizing:border-box}
+body{margin:0;font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg);width:380px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+header{padding:14px 14px 10px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg);z-index:2}
+header img{width:20px;height:20px}
+header h1{margin:0;font-size:14px;font-weight:600;flex:1}
+header h1 span{font-weight:400;color:var(--muted)}
+#ver{color:var(--muted);font-size:11px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);flex:none}
+.dot.connected{background:var(--ok);box-shadow:0 0 6px rgba(129,201,149,.6)}
+.dot.reconnecting{background:var(--warn);animation:pulse 1.2s infinite}
+.dot.disconnected{background:var(--err)}
+@keyframes pulse{50%{opacity:.35}}
+main{padding:10px 12px 12px;display:flex;flex-direction:column;gap:10px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:10px}
+.card h2{margin:0 0 8px;font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;justify-content:space-between}
+.card h2 button{font-size:11px;padding:3px 8px}
+.status-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#status-label{flex:1;font-weight:500}
+#status-transport{font-size:11px;color:var(--muted)}
+.btn{font:inherit;color:var(--fg);background:var(--card);border:1px solid var(--border);border-radius:8px;padding:6px 10px;cursor:pointer}
+.btn:hover{border-color:var(--accent);background:rgba(138,180,248,.1)}
+.btn-primary{color:#202124;background:var(--accent);border-color:var(--accent);font-weight:600}
+.btn-primary:hover{background:#a8c7fa}
+.btn:disabled{opacity:.45;cursor:default}
+.btn-sm{padding:4px 8px;font-size:12px}
+.btn-icon{padding:5px 7px;min-width:28px}
+.row{display:flex;gap:6px}
+.row input{flex:1}
+input{width:100%;padding:7px 10px;font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:8px;outline:none}
+input:focus{border-color:var(--accent)}
+input::placeholder{color:#5f6368}
+.addr-row{display:flex;gap:6px}
+.addr-row input{flex:1}
+.icon-btns{display:flex;gap:4px}
+.icon-btns button{flex:1}
+.tabs{max-height:180px;overflow:auto;display:flex;flex-direction:column;gap:4px}
+.tab{ display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;border:1px solid transparent;cursor:pointer}
+.tab:hover{background:rgba(138,180,248,.08);border-color:var(--border)}
+.tab.active{background:rgba(138,180,248,.14);border-color:rgba(138,180,248,.3)}
+.tab img{width:16px;height:16px;flex:none;background:var(--border);border-radius:3px}
+.tab .title{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}
+.tab .close{opacity:.5;padding:2px 6px;font-size:12px;border:none;background:transparent;color:var(--muted);cursor:pointer}
+.tab .close:hover{opacity:1;color:var(--err)}
+.meta{font-size:11px;color:var(--muted);display:flex;gap:10px;flex-wrap:wrap}
+.kv{display:grid;grid-template-columns:max-content 1fr;gap:4px 10px;font-size:11px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;word-break:break-all}
+.notice{font-size:11px;color:var(--muted);text-align:center;padding:4px}
+.divider{height:1px;background:var(--border);margin:4px 0}
+footer{padding:8px 12px;border-top:1px solid var(--border);display:flex;gap:6px}
+footer a, footer button{flex:1;text-align:center;font-size:12px;padding:6px;border:1px solid var(--border);border-radius:8px;background:transparent;color:var(--muted);cursor:pointer}
+footer a:hover, footer button:hover{color:var(--fg);border-color:var(--accent)}
+#error{color:var(--err);font-size:11px;white-space:pre-wrap;word-break:break-word;background:rgba(242,139,130,.08);border:1px solid rgba(242,139,130,.2);border-radius:8px;padding:6px 8px;display:none}
+#error:not(:empty){display:block}
+</style>
+</head>
+<body>
+<header>
+  <img src="icons/icon48.png" alt="">
+  <h1>Browser Navigator <span id="ver">—</span></h1>
+  <span id="dot" class="dot" title="status"></span>
+</header>
+<main>
+  <div class="card" id="conn-card">
+    <h2>Connection</h2>
+    <div class="status-row">
+      <span id="status-label">Checking…</span>
+      <span id="status-transport"></span>
+    </div>
+    <div id="error"></div>
+    <div class="meta" style="margin-top:6px">
+      <span id="server-url" title="click to copy"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Tabs <span style="font-weight:400;text-transform:none;letter-spacing:0" id="tab-count"></span> <button id="newtab" class="btn-sm btn">+ New</button></h2>
+    <input id="popup-filter" placeholder="Filter tabs by title or URL…" style="margin-bottom:6px">
+    <div id="tabs" class="tabs"><div class="notice">Loading…</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Quick tools</h2>
+    <div class="row" style="flex-wrap:wrap">
+      <button id="shot" class="btn btn-sm">📸 Screenshot</button>
+      <button id="pdf" class="btn btn-sm">📄 PDF</button>
+      <button id="read" class="btn btn-sm">♿ Read page</button>
+      <button id="inspect" class="btn btn-sm">🔍 Inspect</button>
+    </div>
+    <div id="tool-out" class="notice" style="text-align:left;white-space:pre-wrap;max-height:100px;overflow:auto;display:none"></div>
+  </div>
+
+  <div class="card">
+    <h2>Browser</h2>
+    <dl class="kv" id="browser-info"></dl>
+  </div>
+</main>
+<footer>
+  <a href="#" id="open-dashboard" style="flex:1">Dashboard</a>
+</footer>
+<script src="popup.js"></script>
+</body>
+</html>

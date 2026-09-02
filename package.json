@@ -1,15 +1,14 @@
 {
   "name": "browser-navigator-mcp",
-  "version": "2.0.0",
+  "version": "2.0.9",
   "type": "module",
   "description": "MCP server for Brave/Chrome browser automation via extension bridge",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "serve": "node index.js",
-    "host": "node native-host.js",
     "test": "node test.cjs",
-    "syntax": "for f in index.js server.js ws-server.js bridge.js tools.js lib/proto.js lib/security.js lib/tfidf.js; do node --check $f; done"
+    "syntax": "for f in index.js server.js ws-server.js bridge.js tools.js lib/*.js extension/*.js; do node --check $f; done"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

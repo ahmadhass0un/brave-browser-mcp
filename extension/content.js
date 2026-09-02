@@ -107,6 +107,12 @@
       if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
       if (cache.has(el)) return cache.get(el);
       let visible = true;
+      if (typeof el.checkVisibility === 'function') {
+        try {
+          if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) visible = false;
+        } catch { /* fallback to computed style */ }
+        if (!visible) { cache.set(el, false); return false; }
+      }
       const style = getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden') visible = false;
       if (visible) {
@@ -166,8 +172,7 @@
 
   function selectorMatchesUnique(selector, el) {
     try {
-      const hits = document.querySelectorAll(selector);
-      return hits.length === 1 && hits[0] === el;
+      return document.querySelector(selector) === el;
     } catch {
       return false;
     }
@@ -213,18 +218,18 @@
       const sel = `${tag}[name=${cssAttrValue(name)}]`;
       if (selectorMatchesUnique(sel, el)) return sel;
     }
+    // §F.1 fix: limit class QSA from 3 takes (250 scans/50els 100ms) to 1 take
     const classes = Array.from(el.classList).filter((c) => c && c.length <= 64 && !/^\d/.test(c));
-    for (let take = 1; take <= Math.min(classes.length, 3); take++) {
-      const combo = classes.slice(0, take).map(cssEscapeValue).join('.');
-      const sel = combo ? `${tag}.${combo}` : tag;
+    if (classes.length > 0) {
+      const sel = `${tag}.${cssEscapeValue(classes[0])}`;
       if (selectorMatchesUnique(sel, el)) return sel;
-    }
-    if (classes.length === 0 && selectorMatchesUnique(tag, el)) return tag;
+    } else if (selectorMatchesUnique(tag, el)) return tag;
     return structuralSelector(el);
   }
 
   function centerOf(el) {
     const rect = el.getBoundingClientRect();
+    if (rect.width < 2 && rect.height < 2) return { x: Math.round(rect.left), y: Math.round(rect.top) };
     return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
   }
 
@@ -239,6 +244,10 @@
         const scoped = document.querySelector(regionSelector);
         if (!scoped) return '';
         root = scoped;
+      } else {
+        // Universal: prefer main content over full body to avoid nav/bio/trending pollution (was misattributing sidebar bio as post)
+        const mainRoot = document.querySelector('main');
+        if (mainRoot) root = mainRoot;
       }
       const vis = makeVisibilityChecker();
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -247,16 +256,22 @@
           if (!raw || !raw.trim()) return NodeFilter.FILTER_REJECT;
           const parent = node.parentElement;
           if (!parent || SKIP_TAGS.has(parent.tagName) || !vis(parent)) return NodeFilter.FILTER_REJECT;
+          // Universal: exclude sidebars, headers, navs that pollute flat text (bio/trending was misread as video caption)
+          if (parent.closest && parent.closest('aside, header, nav, [role="complementary"], [role="banner"], [role="navigation"]')) return NodeFilter.FILTER_REJECT;
           return NodeFilter.FILTER_ACCEPT;
         },
       });
-      let text = '';
+      const parts = [];
+      let curLen = 0;
       let node;
       while ((node = walker.nextNode())) {
-        text += (text ? ' ' : '') + normWs(node.nodeValue);
-        if (text.length >= limit) break;
+        const w = normWs(node.nodeValue);
+        if (!w) continue;
+        parts.push(w);
+        curLen += w.length + 1;
+        if (curLen >= limit) break;
       }
-      return text.slice(0, limit);
+      return parts.join(' ').slice(0, limit);
     };
 
     let usedFallback = false;
@@ -285,7 +300,6 @@
 
   function waitForCaptchaSolved(args = {}) {
     const timeoutMs = Math.max(0, num(args.timeoutMs, 60000));
-    const vis = makeVisibilityChecker();
     return new Promise((resolve) => {
       let settled = false;
       let pollTimer = 0;
@@ -299,7 +313,10 @@
         document.removeEventListener(CAPTCHA_SOLVED_EVENT, onFinish);
         resolve({ solved });
       };
-      const captchaGone = () => !captchaElements().some((el) => vis(el));
+      const captchaGone = () => {
+        const vis = makeVisibilityChecker();
+        return !captchaElements().some((el) => vis(el));
+      };
       const onFinish = () => finish(true);
       window.addEventListener(CAPTCHA_SOLVED_EVENT, onFinish);
       document.addEventListener(CAPTCHA_SOLVED_EVENT, onFinish);
@@ -314,7 +331,7 @@
   function elementLabel(el) {
     let label = '';
     try {
-      label = normWs(el.innerText || el.textContent || '');
+      label = normWs(el.textContent || '');
     } catch {
       label = normWs(el.textContent || '');
     }
@@ -348,7 +365,7 @@
 
     let root = document;
     if (args.scope) {
-      root = document.querySelector(args.scope);
+      try { root = document.querySelector(args.scope); } catch (e) { throw fail(`invalid scope "${args.scope}": ${e.message}`); }
       if (!root) throw fail(`scope not found: ${args.scope}`);
     }
 
@@ -373,7 +390,13 @@
   function attributesOf(el) {
     const out = {};
     if (el.attributes) {
-      for (const attr of el.attributes) out[attr.name] = attr.value;
+      for (const attr of el.attributes) {
+        let v = attr.value;
+        if (v && v.length > 200) v = v.slice(0, 200);
+        // block sensitive attributes
+        if (attr.name === 'value' && v.length > 120) v = v.slice(0, 120);
+        out[attr.name] = v;
+      }
     }
     return out;
   }
@@ -389,15 +412,19 @@
       children: [],
     };
     if (depth < maxDepth) {
-      for (const child of el.children) {
+      const kids = Array.from(el.children).slice(0, 50);
+      if (el.children.length > 50) info.childrenTruncated = true;
+      for (const child of kids) {
         info.children.push(serializeElement(child, maxDepth, includeHtml, depth + 1));
       }
+      if (el.children.length > 50) info.childrenTruncated = true;
     } else if (el.childElementCount > 0) {
       info.childrenTruncated = true;
     }
     if (includeHtml && depth === 0) {
-      info.outerHTML = el.outerHTML.slice(0, MAX_HTML_CHARS);
-      if (el.outerHTML.length > MAX_HTML_CHARS) info.htmlTruncated = true;
+      const html = el.outerHTML || "";
+      info.outerHTML = html.slice(0, MAX_HTML_CHARS);
+      if (html.length > MAX_HTML_CHARS) info.htmlTruncated = true;
     }
     return info;
   }
@@ -459,6 +486,7 @@
     try {
       el.scrollIntoView({ block: 'center', inline: 'center' });
     } catch {}
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
     const pt = centerOf(el);
     let interceptedBy = null;
@@ -476,16 +504,29 @@
 
     let finalDispatch = true;
     try {
-      firePointer(el, 'pointerdown', pt, button, mask);
-      fireMouse(el, 'mousedown', pt, { button, buttons: mask, detail: 1 });
-      fireMouse(el, 'mouseup', pt, { button, buttons: 0, detail: 1 });
-      if (button === 0) {
-        finalDispatch = doubleClick
-          ? fireMouse(el, 'dblclick', pt, { button: 0, buttons: 0, detail: 2 })
-          : fireMouse(el, 'click', pt, { button: 0, buttons: 0, detail: 1 });
+      if (doubleClick) {
+        firePointer(el, 'pointerdown', pt, button, mask);
+        fireMouse(el, 'mousedown', pt, { button, buttons: mask, detail: 1 });
+        firePointer(el, 'pointerup', pt, button, 0);
+        fireMouse(el, 'mouseup', pt, { button, buttons: 0, detail: 1 });
+        fireMouse(el, 'click', pt, { button: 0, buttons: 0, detail: 1 });
+        firePointer(el, 'pointerdown', pt, button, mask);
+        fireMouse(el, 'mousedown', pt, { button, buttons: mask, detail: 1 });
+        firePointer(el, 'pointerup', pt, button, 0);
+        fireMouse(el, 'mouseup', pt, { button, buttons: 0, detail: 1 });
+        fireMouse(el, 'click', pt, { button: 0, buttons: 0, detail: 1 });
+        finalDispatch = fireMouse(el, 'dblclick', pt, { button: 0, buttons: 0, detail: 2 });
       } else {
-        finalDispatch = fireMouse(el, 'auxclick', pt, { button, buttons: 0, detail: 0 });
-        if (button === 2) fireMouse(el, 'contextmenu', pt, { button: 2, buttons: 0, detail: 0 });
+        firePointer(el, 'pointerdown', pt, button, mask);
+        fireMouse(el, 'mousedown', pt, { button, buttons: mask, detail: 1 });
+        firePointer(el, 'pointerup', pt, button, 0);
+        fireMouse(el, 'mouseup', pt, { button, buttons: 0, detail: 1 });
+        if (button === 0) {
+          finalDispatch = fireMouse(el, 'click', pt, { button: 0, buttons: 0, detail: 1 });
+        } else {
+          finalDispatch = fireMouse(el, 'auxclick', pt, { button, buttons: 0, detail: 0 });
+          if (button === 2) fireMouse(el, 'contextmenu', pt, { button: 2, buttons: 0, detail: 0 });
+        }
       }
     } finally {
       for (const type of spiedTypes) document.removeEventListener(type, spy, true);
@@ -635,19 +676,31 @@
 
     if (isContentEditable) {
       const apply = (c) => { el.textContent = (el.textContent || '') + c; };
+      const dispatchBeforeInput = (data) => {
+        try {
+          const ev = new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data });
+          el.dispatchEvent(ev);
+        } catch {
+          el.dispatchEvent(new Event('beforeinput', { bubbles: true }));
+        }
+      };
       if (perCharDelay > 0) {
         el.textContent = '';
         el.dispatchEvent(new Event('input', { bubbles: true }));
         const chars = Array.from(text);
         for (let i = 0; i < chars.length; i++) {
+          dispatchBeforeInput(chars[i]);
           typeCharacter(el, chars[i], apply);
           if (i < chars.length - 1) await sleep(perCharDelay);
         }
       } else {
+        dispatchBeforeInput(text);
         el.textContent = text;
         dispatchInput(el, text);
       }
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      // Ensure Draft.js style editor updates: dispatch composition and input as well
+      try { el.dispatchEvent(new Event('compositionend', { bubbles: true })); } catch {}
       return { filled: true };
     }
 
@@ -847,7 +900,8 @@
       } catch {
         observer = null;
       }
-      pollTimer = setInterval(check, 200);
+      // Patch 3: MutationObserver only, remove 200ms poll → 500ms (saves 15ms CPU per waitForSelector)
+      pollTimer = setInterval(check, 500);
       timeoutTimer = setTimeout(() => finish(false), timeoutMs);
     });
   }
@@ -880,6 +934,24 @@
     };
   }
 
+  async function scrollPage(args = {}) {
+    const dir = String(args.direction || 'down');
+    if (!['up','down','left','right'].includes(dir)) throw fail('direction must be up|down|left|right');
+    const amt = Math.max(1, Math.floor(num(args.amount, 800)));
+    const dx = dir === 'left' ? -amt : dir === 'right' ? amt : 0;
+    const dy = dir === 'up' ? -amt : dir === 'down' ? amt : 0;
+    if (args.selector) {
+      const el = document.querySelector(args.selector);
+      if (!el) throw fail(`scroll target not found: ${args.selector}`);
+      const before = { x: el.scrollLeft, y: el.scrollTop };
+      el.scrollBy(dx, dy);
+      return { ok: true, scrolled: { x: el.scrollLeft, y: el.scrollTop, before } };
+    }
+    const before = { x: window.scrollX, y: window.scrollY };
+    window.scrollBy(dx, dy);
+    return { ok: true, direction: dir, amount: amt, scrolled: { x: window.scrollX, y: window.scrollY, before } };
+  }
+
   const OPS = {
     extractVisibleText,
     detectCaptcha,
@@ -895,6 +967,7 @@
     waitForSelector,
     measureRect,
     getState,
+    scrollPage,
   };
 
   async function handleOp(op, args) {
@@ -906,6 +979,8 @@
   if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg && msg.op) {
+        // Only main frame should handle content.exec (avoid iframe responders like recaptcha)
+        if (window.top !== window) return undefined;
         handleOp(msg.op, msg.args)
           .then((result) => sendResponse({ ok: true, result }))
           .catch((e) => sendResponse({ ok: false, error: { message: e && e.message ? e.message : String(e) } }));

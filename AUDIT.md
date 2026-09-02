@@ -1,5 +1,9 @@
 # Browser Navigator MCP — Security & Code Quality Audit
 
+> **Note 2026-08-30:** This audit covers the **legacy CDP/Playwright era** (pre-`dab0e6d` 2026-08-23). The current architecture is **MV3 extension + WS** (`ws://127.0.0.1:9224`, `extension/background.js` ~1978 lines, `tools.js` 1645 lines, no Playwright). Many fixes below still apply (path traversal, `execute_js` confirm, cookie encryption, SSRF guards via `lib/security.js:8`), but line numbers and CDP-specific items (e.g., `#20` `0.0.0.0` bind, `#11` `createContext`) refer to the old code. For current extension audit see `EXTENSION-PLAN.md` § Security guards + `background.js` §5 + `tools.js` guards.
+
+# Browser Navigator MCP — Security & Code Quality Audit (legacy)
+
 ## 🔴 CRITICAL (6) — ALL FIXED
 
 | # | Issue | Line | Status |
@@ -88,3 +92,13 @@
 | 67 | **FEAT F5** Script injection (vs mcp-chrome `chrome_inject_script`) | ✅ LOW → `inject_script`/`send_to_injected` tools via CDP `Page.addScriptToEvaluateOnNewDocument` in isolated `mcp_injected` world. Scripts persist across navigations; bidirectional messaging via CustomEvents. |
 | 68 | **FEAT F6** Background operations (vs mcp-chrome `background` param) | ✅ MED → `background: true` param added to `navigate` and `tabs open`. Operates without activating/focusing the target tab. |
 | 69 | **FEAT F7** Bookmark management + history search (vs mcp-chrome `chrome_bookmark_*`/`chrome_history`) | ✅ LOW → `bookmark_add`/`bookmark_delete`/`bookmark_search`/`bookmark_list` (local JSON store + Chrome import) + `history_search` (time-filtered, recorded by navigate). |
+
+---
+
+## Current (MV3 extension + WS) — 2026-08-30 delta
+
+*Extension `manifest.json:8` no longer uses Playwright/CDP from Node; all tab/window/debugger work is via `extension/background.js` (`chrome.tabs`, `chrome.windows`, `chrome.scripting`, `chrome.debugger` allowlist `ALLOWED_CDP_METHODS` + `chrome.cookies`, `storage`, `webRequest`). `tools.js` 1645 lines, `background.js` 1978 lines, `bridge.js` 596 lines, `ws-server.js:30` `ws://127.0.0.1:9224` + health probe (`HEAD /` → 200) so `openSocket` can `probeHealth` before `new WebSocket` and avoid noisy `ERR_CONNECTION_REFUSED` logs.*
+
+*New UI:* `popup.html` (380px) + `dashboard.html` (6 pages: overview/browser/tools/captures/settings/logs) replaces `options.html` (deleted, `manifest.json:22` `options_page` → `dashboard.html`). `history` permission removed. `dashboard.html` Captures → PDF now via `chrome.debugger` `Page.printToPDF` directly (download), not just MCP. `popup.js` `inspect` now filters invisible/empty nodes and handles `chrome://` blocked pages.*
+
+*Connection UX:* `background.js:1855` `uiStatus` returns `waiting` (yellow pulse, `Waiting for MCP server…`) not red `disconnected` until `wsReady`; `popup.js:17`/`dashboard.js:23`/`options.js:9` show `waiting`. Refresh `Extension context invalidated` at `background.js:487` `new WebSocket` is suppressed via `self.addEventListener('error'/'unhandledrejection')` + `console.error` filter and `if (!chrome.runtime?.id) return` guards in `connectLoop`/`scheduleReconnect`/`loadSettings`/`openSocket`.*

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser Navigator — Icon Variants (10)</title>
+<style>
+:root{color-scheme:dark;--bg:#1b1c1f;--card:#26282c;--border:#3c4043;--fg:#e8eaed;--muted:#9aa0a6;--accent:#8ab4f8}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg);padding:24px}
+h1{margin:0 0 8px;font-size:22px}
+p.muted{color:var(--muted);margin:0 0 18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:10px}
+.card h2{margin:0;font-size:15px;display:flex;align-items:center;gap:8px}
+.card h2 span.num{background:var(--accent);color:#202124;padding:2px 7px;border-radius:20px;font-size:11px;font-weight:700}
+.card .desc{color:var(--muted);font-size:12px;min-height:28px}
+.row{display:flex;gap:10px;align-items:end;flex-wrap:wrap}
+.box{flex:none;display:flex;flex-direction:column;align-items:center;gap:6px}
+.box small{color:var(--muted);font-size:10px}
+.preview{padding:10px;border-radius:10px;display:flex;gap:10px;align-items:center;background:#202124;border:1px solid var(--border)}
+.preview.light{background:#e8eaed;border-color:#dadce0}
+.preview img{image-rendering:auto;flex:none}
+.actions{margin-top:6px;display:flex;gap:6px}
+.btn{font:inherit;font-size:12px;padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--fg);cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);color:#202124;border-color:var(--accent);font-weight:600}
+.note{margin-top:18px;padding:12px;background:rgba(138,180,248,.1);border:1px solid rgba(138,180,248,.25);border-radius:10px;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<h1>Browser Navigator — 10 Icon Variants</h1>
+<p class="muted">Pick your favorite number (1–10). Each favicon is shown at 128/48/32/16 plus toolbar simulation (16px on dark & light). Current installed is <strong>v1 (Compass Modern)</strong> at <code>extension/icons/icon*.png</code>. Preview also works on <code>chrome://extensions</code>.</p>
+<div class="grid" id="grid"></div>
+<div class="note">To apply: tell me the number (e.g. “v6”) and I’ll copy <code>variants/vN</code> → <code>extension/icons/</code> + bump manifest + reload extension. You can also open <code>chrome://extensions</code> → Load unpacked to see toolbar icon live.</div>
+<script>
+const variants=[
+ {id:"v1", name:"Compass Modern", desc:"Dark card, blue ring, bi-color north arrow + south tail, white ticks — refined current (balanced, recognizable at 16px)."},
+ {id:"v2", name:"Minimal Thin", desc:"Thin white arrow on dark, red south tip, ultra-minimal — airy, elegant, high contrast."},
+ {id:"v3", name:"Browser Arrow", desc:"Browser chrome bar (traffic lights) + diagonal up-right arrow — says “browser automation” directly."},
+ {id:"v4", name:"Map Pin N", desc:"Blue map pin with white N — classic navigation pin, very legible at small sizes."},
+ {id:"v5", name:"BN Monogram", desc:"Split dark card with B (white) + N (blue) — typographic, brandable, minimal iconography."},
+ {id:"v6", name:"Neon Glow", desc:"Midnight blue, glowing ring + neon arrow with soft halo — vibrant, standout in toolbar."},
+ {id:"v7", name:"Greyscale", desc:"Light card, black arrow/ring — brutalist, high contrast on dark browser UI, print-like."},
+ {id:"v8", name:"Gradient Orb", desc:"Blue gradient planet + orbit ring with arrow — orbital/navigation, playful, modern."},
+ {id:"v9", name:"Flat Teal", desc:"Teal flat compass on dark — duotone, Material-like, distinct from blue family."},
+ {id:"v10", name:"Outline Only", desc:"White outline compass + arrow — line-art, light, works on any background."},
+];
+const grid=document.getElementById('grid');
+variants.forEach(v=>{
+  const card=document.createElement('div'); card.className='card';
+  card.innerHTML=`
+    <h2><span class="num">${v.id.toUpperCase()}</span> ${v.name}</h2>
+    <div class="desc">${v.desc}</div>
+    <div class="preview" title="Dark toolbar">
+      <img src="extension/icons/variants/${v.id}/icon128.png" width="48" height="48" alt="">
+      <img src="extension/icons/variants/${v.id}/icon48.png" width="32" height="32" alt="">
+      <img src="extension/icons/variants/${v.id}/icon32.png" width="24" height="24" alt="">
+      <img src="extension/icons/variants/${v.id}/icon16.png" width="16" height="16" alt="" style="outline:1px dashed #555; outline-offset:2px">
+      <span style="margin-left:auto;font-size:10px;color:var(--muted)">dark</span>
+    </div>
+    <div class="preview light" title="Light toolbar">
+      <img src="extension/icons/variants/${v.id}/icon48.png" width="24" height="24" alt="">
+      <img src="extension/icons/variants/${v.id}/icon16.png" width="16" height="16" alt="">
+      <span style="margin-left:auto;font-size:10px;color:#5f6368">light</span>
+    </div>
+    <div class="row">
+      <div class="box"><img src="extension/icons/variants/${v.id}/icon128.png" width="64" height="64" style="border:1px solid var(--border);border-radius:8px;background:#1b1c1f"><small>128</small></div>
+      <div class="box"><img src="extension/icons/variants/${v.id}/icon48.png" width="48" height="48" style="border:1px solid var(--border);border-radius:8px;background:#1b1c1f"><small>48</small></div>
+      <div class="box"><img src="extension/icons/variants/${v.id}/icon32.png" width="32" height="32" style="border:1px solid var(--border);border-radius:8px;background:#1b1c1f"><small>32</small></div>
+      <div class="box"><img src="extension/icons/variants/${v.id}/icon16.png" width="16" height="16" style="border:1px solid var(--border);background:#1b1c1f"><small>16</small></div>
+    </div>
+    <div class="actions">
+      <button class="btn primary" onclick="apply('${v.id}')">Use ${v.id.toUpperCase()}</button>
+      <button class="btn" onclick="window.open('extension/icons/variants/${v.id}/icon128.png','_blank')">Open 128</button>
+    </div>
+  `;
+  grid.appendChild(card);
+});
+function apply(id){
+  navigator.clipboard.writeText(id).catch(()=>{});
+  alert('You picked '+id.toUpperCase()+' — tell me "'+id+'" in chat and I’ll install it. (copied to clipboard)');
+}
+</script>
+</body>
+</html>

@@ -1,14 +1,14 @@
 /**
  * browser-navigator — tools.js
- * Registers all 41 MCP tools on an McpServer instance.
+ * Registers all 43 MCP tools on an McpServer instance.
  */
 
 import { z } from "zod";
 import * as bridge from "./bridge.js";
 import { assertSafeUrl, encryptCookies, decryptCookies } from "./lib/security.js";
 import { tokenize, termFreq, idf, cosineSimilarity } from "./lib/tfidf.js";
-import { readFileSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
-import { join, dirname, isAbsolute } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
+import { join, dirname, isAbsolute, resolve, sep } from "node:path";
 
 const DATA_DIR = join(process.cwd(), "data");
 const SHOTS_DIR = join(DATA_DIR, "screenshots");
@@ -213,11 +213,24 @@ function pageInfo() {
 function pageExtractHTML(selector) {
   const el = selector ? document.querySelector(selector) : document.documentElement;
   if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: selector };
-  return { ok: true, html: el.outerHTML, url: location.href, title: document.title };
+  const html = el.outerHTML || "";
+  const MAX = 500_000;
+  return { ok: true, html: html.slice(0, MAX), truncated: html.length > MAX, url: location.href, title: document.title };
 }
 
+// NOTE: esc/path helpers are duplicated across pageCollectCandidates, pageLocateByText
+// and pageInspectDeep intentionally — each page* function is stringified and
+// shipped via cs.eval, so they must be closure-free and cannot share helpers.
 function pageCollectCandidates() {
   const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/([^\w-])/g, "\\$1"));
+  // §F.1 fix: path filter 48k ops — avoid [...parent.children].filter array alloc per level
+  const nthOfType = (elm) => {
+    const tag = elm.tagName;
+    let idx = 1, sameCount = 1;
+    for (let sib = elm.previousElementSibling; sib; sib = sib.previousElementSibling) if (sib.tagName === tag) { idx++; sameCount++; }
+    for (let sib = elm.nextElementSibling; sib; sib = sib.nextElementSibling) if (sib.tagName === tag) sameCount++;
+    return { idx, sameCount };
+  };
   const path = (elm) => {
     if (elm.id) return "#" + esc(elm.id);
     const parts = [];
@@ -225,9 +238,8 @@ function pageCollectCandidates() {
     while (cur && cur.nodeType === 1 && parts.length < 6) {
       const parent = cur.parentElement;
       if (!parent) { parts.unshift(cur.tagName.toLowerCase()); break; }
-      const same = [...parent.children].filter((c) => c.tagName === cur.tagName);
-      const idx = same.indexOf(cur) + 1;
-      parts.unshift(same.length > 1 ? `${cur.tagName.toLowerCase()}:nth-of-type(${idx})` : cur.tagName.toLowerCase());
+      const { idx, sameCount } = nthOfType(cur);
+      parts.unshift(sameCount > 1 ? `${cur.tagName.toLowerCase()}:nth-of-type(${idx})` : cur.tagName.toLowerCase());
       if (parent.id) { parts.unshift("#" + esc(parent.id)); break; }
       cur = parent;
     }
@@ -280,10 +292,34 @@ function pageCollectCandidates() {
 
 function pageLocateByText(text) {
   const needle = String(text).trim().toLowerCase();
-  const el = [...document.querySelectorAll("body *")]
-    .find((n) => !n.children.length && (n.textContent || "").trim().toLowerCase().includes(needle)) ?? null;
+  let foundEl = null;
+  try {
+    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      const txt = (n.nodeValue || "").trim().toLowerCase();
+      if (!txt.includes(needle)) continue;
+      const parent = n.parentElement;
+      if (!parent) continue;
+      if (parent.children.length !== 0) continue;
+      foundEl = parent;
+      break;
+    }
+  } catch { foundEl = null; }
+  if (!foundEl) {
+    foundEl = [...document.querySelectorAll("body *")]
+      .find((n) => !n.children.length && (n.textContent || "").trim().toLowerCase().includes(needle)) ?? null;
+  }
+  const el = foundEl;
   if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: text };
   const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/([^\w-])/g, "\\$1"));
+  const nthOfType2 = (elm) => {
+    const tag = elm.tagName;
+    let idx = 1, sameCount = 1;
+    for (let sib = elm.previousElementSibling; sib; sib = sib.previousElementSibling) if (sib.tagName === tag) { idx++; sameCount++; }
+    for (let sib = elm.nextElementSibling; sib; sib = sib.nextElementSibling) if (sib.tagName === tag) sameCount++;
+    return { idx, sameCount };
+  };
   const path = (elm) => {
     if (elm.id) return "#" + esc(elm.id);
     const parts = [];
@@ -291,9 +327,8 @@ function pageLocateByText(text) {
     while (cur && cur.nodeType === 1 && parts.length < 6) {
       const parent = cur.parentElement;
       if (!parent) { parts.unshift(cur.tagName.toLowerCase()); break; }
-      const same = [...parent.children].filter((c) => c.tagName === cur.tagName);
-      const idx = same.indexOf(cur) + 1;
-      parts.unshift(same.length > 1 ? `${cur.tagName.toLowerCase()}:nth-of-type(${idx})` : cur.tagName.toLowerCase());
+      const { idx, sameCount } = nthOfType2(cur);
+      parts.unshift(sameCount > 1 ? `${cur.tagName.toLowerCase()}:nth-of-type(${idx})` : cur.tagName.toLowerCase());
       if (parent.id) { parts.unshift("#" + esc(parent.id)); break; }
       cur = parent;
     }
@@ -307,11 +342,32 @@ function pageInspectDeep(t, maxDepth, includeHtml) {
   if (t.selector) el = document.querySelector(t.selector);
   else if (t.text != null) {
     const needle = String(t.text).trim().toLowerCase();
-    el = [...document.querySelectorAll("body *")]
+    // §F.1 fix: QSA body* 10k scan — use TreeWalker like pageLocateByText
+    const root = document.body || document.documentElement;
+    let found = null;
+    if (root) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let n;
+      while ((n = walker.nextNode())) {
+        const txt = (n.nodeValue || "").trim().toLowerCase();
+        if (!txt.includes(needle)) continue;
+        const parent = n.parentElement;
+        if (!parent || parent.children.length !== 0) continue;
+        found = parent; break;
+      }
+    }
+    el = found ?? [...document.querySelectorAll("body *")]
       .find((n) => !n.children.length && (n.textContent || "").trim().toLowerCase().includes(needle)) ?? null;
   }
   if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.text };
   const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/([^\w-])/g, "\\$1"));
+  const nthDeep = (elm) => {
+    const tag = elm.tagName;
+    let idx = 1, sameCount = 1;
+    for (let sib = elm.previousElementSibling; sib; sib = sib.previousElementSibling) if (sib.tagName === tag) { idx++; sameCount++; }
+    for (let sib = elm.nextElementSibling; sib; sib = sib.nextElementSibling) if (sib.tagName === tag) sameCount++;
+    return { idx, sameCount };
+  };
   const cssPath = (elm) => {
     if (elm.id) return "#" + esc(elm.id);
     const parts = [];
@@ -319,9 +375,8 @@ function pageInspectDeep(t, maxDepth, includeHtml) {
     while (cur && cur.nodeType === 1 && parts.length < 6) {
       const parent = cur.parentElement;
       if (!parent) { parts.unshift(cur.tagName.toLowerCase()); break; }
-      const same = [...parent.children].filter((c) => c.tagName === cur.tagName);
-      const idx = same.indexOf(cur) + 1;
-      parts.unshift(same.length > 1 ? `${cur.tagName.toLowerCase()}:nth-of-type(${idx})` : cur.tagName.toLowerCase());
+      const { idx, sameCount } = nthDeep(cur);
+      parts.unshift(sameCount > 1 ? `${cur.tagName.toLowerCase()}:nth-of-type(${idx})` : cur.tagName.toLowerCase());
       if (parent.id) { parts.unshift("#" + esc(parent.id)); break; }
       cur = parent;
     }
@@ -360,14 +415,15 @@ function pageInspectDeep(t, maxDepth, includeHtml) {
 function pageRectOf(selector) {
   const el = document.querySelector(selector);
   if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: selector };
-  el.scrollIntoView({ block: "center", inline: "center" });
+  try { el.scrollIntoView({ block: "center", inline: "center" }); } catch {}
   const r = el.getBoundingClientRect();
+  if (!r.width || !r.height) return { ok: false, reason: "ELEMENT_NOT_FOUND", message: `Element ${selector} has no size` };
   return {
     ok: true,
-    x: r.left + window.scrollX,
-    y: r.top + window.scrollY,
-    width: r.width,
-    height: r.height,
+    x: r.left,
+    y: r.top,
+    width: Math.max(1, Math.min(r.width, 8000)),
+    height: Math.max(1, Math.min(r.height, 8000)),
   };
 }
 
@@ -519,7 +575,9 @@ function pageSearchResults(platform, limit) {
 
   if (results.length < limit) {
     const engineSelf = /(^|\.)(google|bing\.com|duckduckgo|brave\.com|youtube|reddit|github|stackoverflow|wikipedia)/i;
-    for (const a of qsa("a[href]")) {
+    // F.3: cap fallback scan to 500 anchors (was 5k → 80-250ms)
+    const fallbackAnchors = qsa("a[href]").slice(0, 500);
+    for (const a of fallbackAnchors) {
       if (results.length >= limit) break;
       if (!(rule && rule.accept)) {
         const t = clean(a.textContent);
@@ -562,7 +620,7 @@ export function registerTools(server, ctx) {
       return {
         content: [{
           type: "text",
-          text: JSON.stringify({ ok: false, error: e?.message || String(e), code: e?.code ?? null }, null, 2),
+          text: JSON.stringify({ ok: false, error: e?.message || String(e), code: e?.code ?? null, retriable: !!e?.retriable }, null, 2),
         }],
         isError: true,
       };
@@ -598,6 +656,13 @@ export function registerTools(server, ctx) {
 
   const evalV = async (tabId, fn, args = [], opts = {}) => val(await bridge.dom.eval(tabId, fn, args, opts));
 
+  // CSP-safe wrapper: try content.js (ISOLATED, no eval string) first, fallback to cs.eval
+  const contentExec = async (tabId, op, args) => val(await bridge.content.exec(tabId, op, args));
+  const tryContentThenEval = async (tabId, op, opArgs, fallbackFn, fallbackArgs) => {
+    try { return await contentExec(tabId, op, opArgs); }
+    catch { return await evalV(tabId, fallbackFn, fallbackArgs); }
+  };
+
   const scopeSel = (selector, scope) =>
     (scope && scope.trim() ? `${scope.trim()} ${selector}` : selector);
 
@@ -617,8 +682,18 @@ export function registerTools(server, ctx) {
       ? (isAbsolute(savePath) ? savePath : join(SHOTS_DIR, savePath))
       : join(SHOTS_DIR, `${ext}_${Date.now()}.${ext}`);
     if (!p.toLowerCase().endsWith(`.${ext}`)) p += `.${ext}`;
-    mkdirSync(dirname(p), { recursive: true });
-    return p;
+    const resolved = resolve(p);
+    const base = resolve(SHOTS_DIR);
+    if (resolved !== base && !resolved.startsWith(base + sep)) {
+      throw new Error(`Path traversal blocked: ${savePath} resolves outside ${SHOTS_DIR}`);
+    }
+    try {
+      mkdirSync(dirname(resolved), { recursive: true, mode: 0o700 });
+    } catch (e) {
+      console.error(`[tools] mkdir failed for ${dirname(resolved)}:`, e?.message || e);
+      throw new Error(`Failed to create directory ${dirname(resolved)}: ${e?.message || e}`);
+    }
+    return resolved;
   };
 
   async function performClick(tabId, opts = {}) {
@@ -631,10 +706,22 @@ export function registerTools(server, ctx) {
       ? resolveTarget({ selector, by_text: byText, scope, ref })
       : null;
 
+    // CSP-safe fast path: content.js clickElement (ISOLATED, no eval string)
+    if (target) {
+      try {
+        const r = await contentExec(tabId, "clickElement", target);
+        // content click succeeded, still try CDP trusted for isTrusted if requested
+        if (trusted && r && r.clicked !== false) return { ok: true, mode: "content", ...r, target: target.selector ?? target.text ?? null };
+      } catch {}
+    }
+
     let pt = (x != null && y != null) ? { ok: true, x, y } : null;
     if (!pt) {
       if (!target) throw new Error("click needs selector, by_text, ref, or x/y coordinates");
-      pt = await evalV(tabId, pageClickCoords, [target]);
+      try { pt = await evalV(tabId, pageClickCoords, [target]); }
+      catch { // fallback to content click already tried, rethrow
+        throw new Error(`click target not found: ${target.selector ?? target.text}`);
+      }
     }
 
     if (trusted) {
@@ -668,6 +755,15 @@ export function registerTools(server, ctx) {
       if (!info?.selector) throw new Error(`Unknown ref "${ref}" — run read_page to refresh refs`);
       sel = info.selector;
     }
+    // CSP-safe: try content.js fillField first
+    try {
+      const target = sel ? { selector: scopeSel(sel, scope) } : null;
+      if (target) return await contentExec(tabId, "fillField", { ...target, text: value });
+      else {
+        // no selector -> try content fill with active element fallback via eval
+        throw new Error("no selector");
+      }
+    } catch {}
     if (delayPerChar > 0) {
       return evalV(tabId, pageTypeChars, [{ selector: sel ? scopeSel(sel, scope) : null }, value, delayPerChar]);
     }
@@ -676,7 +772,8 @@ export function registerTools(server, ctx) {
   }
 
   async function performScroll(tabId, { direction = "down", amount = 800, selector, scope } = {}) {
-    return evalV(tabId, pageScroll, [direction, amount, selector ? scopeSel(selector, scope) : null]);
+    try { return await contentExec(tabId, "scrollPage", { direction, amount, selector: selector ? scopeSel(selector, scope) : null }); }
+    catch { return evalV(tabId, pageScroll, [direction, amount, selector ? scopeSel(selector, scope) : null]); }
   }
 
   async function performHover(tabId, { selector, by_text, scope, ref, x, y } = {}) {
@@ -691,21 +788,33 @@ export function registerTools(server, ctx) {
   }
 
   async function performPressKey(tabId, { key, times = 1, selector } = {}) {
-    if (selector) await evalV(tabId, pageFocus, [{ selector }]);
-    return evalV(tabId, pagePressKey, [key, times]);
+    try {
+      if (selector) await contentExec(tabId, "focusElement", { selector });
+      return await contentExec(tabId, "pressKeys", { keys: key, times });
+    } catch {
+      if (selector) await evalV(tabId, pageFocus, [{ selector }]);
+      return evalV(tabId, pagePressKey, [key, times]);
+    }
   }
 
   async function capturePng(tabId, { fullPage = false, selector, savePath } = {}) {
     const params = { format: "png", captureBeyondViewport: !!fullPage, optimizeForSpeed: true };
     if (selector) {
       const r = await evalV(tabId, pageRectOf, [selector]);
-      params.clip = { x: r.x, y: r.y, width: r.width, height: r.height, scale: 1 };
+      if (!r.width || !r.height) throw new Error(`Element ${selector} has no size`);
+      params.clip = { x: Math.round(r.x), y: Math.round(r.y), width: r.width, height: r.height, scale: 1 };
+      if (params.clip.width <= 0 || params.clip.height <= 0) throw new Error(`Invalid clip for ${selector}`);
     }
     const shot = await bridge.dbg.command(tabId, "Page.captureScreenshot", params);
     if (!shot?.data) throw new Error("Browser returned no screenshot data");
     const buf = Buffer.from(shot.data, "base64");
     const out = resolveOut(savePath, "png");
-    writeFileSync(out, buf);
+    try {
+      writeFileSync(out, buf, { mode: 0o600 });
+    } catch (e) {
+      console.error(`[tools] writeFile failed for ${out}:`, e?.message || e);
+      throw new Error(`Failed to write screenshot to ${out}: ${e?.message || e}`);
+    }
     return { savedTo: out, bytes: buf.length, format: "png", fullPage: !!fullPage, clippedTo: selector ?? null };
   }
 
@@ -715,7 +824,12 @@ export function registerTools(server, ctx) {
     if (!pdf?.data) throw new Error("Browser returned no PDF data");
     const buf = Buffer.from(pdf.data, "base64");
     const out = resolveOut(savePath, "pdf");
-    writeFileSync(out, buf);
+    try {
+      writeFileSync(out, buf, { mode: 0o600 });
+    } catch (e) {
+      console.error(`[tools] writeFile failed for ${out}:`, e?.message || e);
+      throw new Error(`Failed to write PDF to ${out}: ${e?.message || e}`);
+    }
     return { savedTo: out, bytes: buf.length, format: "pdf" };
   }
 
@@ -729,9 +843,30 @@ export function registerTools(server, ctx) {
 
   async function snapshotCookies(filter = {}) {
     const list = unwrapList(await bridge.cookies.all(filter));
-    mkdirSync(COOKIES_DIR, { recursive: true });
-    const out = join(COOKIES_DIR, `cookies_${Date.now()}.json.enc`);
-    writeFileSync(out, JSON.stringify(encryptCookies(list)));
+    try {
+      mkdirSync(COOKIES_DIR, { recursive: true, mode: 0o700 });
+    } catch (e) {
+      console.error(`[tools] mkdir failed for ${COOKIES_DIR}:`, e?.message || e);
+      throw new Error(`Failed to create cookies dir: ${e?.message || e}`);
+    }
+    // rotate: keep last 20
+    try {
+      const files = readdirSync(COOKIES_DIR).filter(f => f.endsWith(".json.enc")).sort();
+      if (files.length >= 20) {
+        for (const f of files.slice(0, files.length - 19)) {
+          try { unlinkSync(join(COOKIES_DIR, f)); } catch {}
+        }
+      }
+    } catch {}
+    const out = join(COOKIES_DIR, `cookies_${Date.now()}_${Math.random().toString(36).slice(2,6)}.json.enc`);
+    try {
+      const payload = JSON.stringify(encryptCookies(list));
+      if (payload.length > 1_000_000) throw new Error("snapshot too large");
+      writeFileSync(out, payload, { mode: 0o600 });
+    } catch (e) {
+      console.error(`[tools] writeFile failed for ${out}:`, e?.message || e);
+      throw new Error(`Failed to write cookies snapshot to ${out}: ${e?.message || e}`);
+    }
     return { file: out, count: list.length };
   }
 
@@ -764,14 +899,16 @@ export function registerTools(server, ctx) {
       return json({ ok: true, disconnected: true });
     }));
 
-  // 3. navigate
+  // 3. navigate — P0.2 adds width/height viewport passthrough (keep BN perf, no extra hops)
   server.tool("navigate", "Navigate a tab to a URL and wait for it to settle", {
     url: z.string().url(),
     wait_until: z.enum(["commit", "domcontentloaded", "load", "networkidle"]).default("load"),
     timeout_ms: z.number().int().min(1000).max(120000).default(30000),
     tab_id: z.number().int().optional(),
     background: z.boolean().default(false),
-  }, guard(async ({ url, wait_until, timeout_ms, tab_id, background }) => {
+    width: z.number().int().min(100).max(8000).optional(),
+    height: z.number().int().min(100).max(8000).optional(),
+  }, guard(async ({ url, wait_until, timeout_ms, tab_id, background, width, height }) => {
     assertSafeUrl(url);
     // Resolve tab_id: explicit > currentTabId > active tab from extension
     let resolvedTabId = tab_id;
@@ -794,6 +931,9 @@ export function registerTools(server, ctx) {
     }
     const result = await bridge.nav.goto(url, {
       tabId: resolvedTabId, waitUntil: wait_until, timeoutMs: timeout_ms,
+      ...(Number.isFinite(width) ? { width } : {}),
+      ...(Number.isFinite(height) ? { height } : {}),
+      background,
     });
     addHistoryEntry({ url, title: result?.title || url, tabId: resolvedTabId });
     return json(result);
@@ -874,18 +1014,20 @@ export function registerTools(server, ctx) {
     return json(await performScroll(tab(), { direction, amount, selector }));
   }));
 
-  // 10. get_page_info
+  // 10. get_page_info (CSP-safe: content.js first)
   server.tool("get_page_info", "Get the current page's URL, title, loading status, scroll state, interactivity, and CAPTCHA presence", {
     tab_id: z.number().int().optional(),
   }, guard(async ({ tab_id }) => {
     const tabId = tab(tab_id);
-    const info = await evalV(tabId, pageInfo, []);
-    const captcha = await bridge.dom.detectCaptcha(tabId).catch(() => null);
-    return json({
-      tabId,
-      ...info,
-      captcha: captcha ? { detected: captcha.detected, kind: captcha.kind ?? null } : null,
-    });
+    let info;
+    try {
+      const st = await contentExec(tabId, "getState", {});
+      info = { url: st.url, title: st.title, readyState: st.readyState, viewport: null, scroll: null, selection: null, interactiveCount: 0, referrer: null };
+    } catch { info = await evalV(tabId, pageInfo, []); }
+    let captcha = null;
+    try { const c = await contentExec(tabId, "detectCaptcha", {}); captcha = { detected: c.detected, kind: c.type ?? null }; }
+    catch { try { const c2 = await bridge.dom.detectCaptcha(tabId); captcha = c2 ? { detected: c2.detected, kind: c2.kind ?? null } : null; } catch { captcha = null; } }
+    return json({ tabId, ...info, captcha });
   }));
 
   // 11. get_page_content
@@ -896,14 +1038,26 @@ export function registerTools(server, ctx) {
   }, guard(async ({ format, limit, selector }) => {
     const tabId = await ensureTab();
     if (format === "html") {
-      const res = await evalV(tabId, pageExtractHTML, [selector ?? null]);
+      let res;
+      try {
+        const st = await contentExec(tabId, "getState", {});
+        const htmlRes = await contentExec(tabId, "inspectDom", { selector: selector || "html", max_depth: 1, include_html: true });
+        res = { url: st.url, title: st.title, html: htmlRes.outerHTML || "" };
+      } catch { res = await evalV(tabId, pageExtractHTML, [selector ?? null]); }
       return json({
         format: "html", selector: selector ?? null, url: res.url, title: res.title,
         truncated: res.html.length > limit,
         content: res.html.slice(0, limit),
       });
     }
-    const res = await bridge.dom.extractVisibleText(tabId, selector ?? null);
+    let res;
+    try {
+      const txt = await contentExec(tabId, "extractVisibleText", { region: selector ?? null, limit, fallbackToBody: true });
+      const st = await contentExec(tabId, "getState", {});
+      res = { url: st.url, title: st.title, text: txt.text || "" };
+    } catch {
+      res = await bridge.dom.extractVisibleText(tabId, selector ?? null);
+    }
     return json({
       format: "text", selector: selector ?? null, url: res.url, title: res.title,
       truncated: (res.text || "").length > limit,
@@ -963,7 +1117,19 @@ export function registerTools(server, ctx) {
       if (interesting.length >= max_refs * 3) break;
     }
 
-    const { candidates, url, title } = await evalV(tabId, pageCollectCandidates, []);
+    let candidates, url, title;
+    try {
+      const li = await contentExec(tabId, "listInteractive", { kind: "all", limit: 800 });
+      const st2 = await contentExec(tabId, "getState", {});
+      candidates = (li.elements || []).map(e => ({
+        selector: e.selector, tag: e.tag, role: e.role || null, name: e.text || e.ariaLabel || null,
+        href: e.href || null, value: e.value || null, visible: true,
+      }));
+      url = st2.url; title = st2.title;
+    } catch {
+      const res = await evalV(tabId, pageCollectCandidates, []);
+      candidates = res.candidates; url = res.url; title = res.title;
+    }
     const norm = (s) => (s ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
     const ROLE_ALIASES = { searchbox: "textbox", menubar: "menuitem", treeitem: "option" };
 
@@ -1031,26 +1197,38 @@ export function registerTools(server, ctx) {
     let pageUrl;
 
     if (kind === "image" || kind === "heading") {
-      const res = await evalV(tabId, pageCollectCandidates, []);
+      let res;
+      try {
+        const li = await contentExec(tabId, "listInteractive", { kind: "all", limit: 800 });
+        const st = await contentExec(tabId, "getState", {});
+        res = { title: st.title, url: st.url, candidates: (li.elements||[]).map(e=>({tag:e.tag,name:e.text||e.ariaLabel,selector:e.selector,href:e.href,visible:true})) };
+      } catch { res = await evalV(tabId, pageCollectCandidates, []); }
       pageTitle = res.title;
       pageUrl = res.url;
       elements = res.candidates.filter((c) =>
         (kind === "image" ? c.tag === "img" : /^h[1-6]$/.test(c.tag)))
         .map((c) => ({ tag: c.tag, name: c.name, selector: c.selector, href: c.href, visible: c.visible }));
     } else {
-      const res = await bridge.dom.listInteractive(tabId, { limit: 500 });
-      pageTitle = res.title;
-      pageUrl = res.url;
-      const KIND_PREDICATE = {
-        all: () => true,
-        link: (e) => e.tag === "a" || e.role === "link",
-        button: (e) => e.tag === "button" || e.role === "button"
-          || (e.tag === "input" && ["submit", "button", "reset"].includes(e.type)),
-        input: (e) => e.tag === "input" || ["textbox", "searchbox", "spinbutton"].includes(e.role),
-        select: (e) => e.tag === "select" || e.role === "combobox",
-        textarea: (e) => e.tag === "textarea",
-      };
-      elements = res.elements.filter(KIND_PREDICATE[kind] || (() => true));
+      let res;
+      try {
+        const li = await contentExec(tabId, "listInteractive", { kind, limit: 500 });
+        const st = await contentExec(tabId, "getState", {});
+        res = { title: st.title, url: st.url, elements: (li.elements||[]).map(e=>({tag:e.tag, role:e.role, name:e.text||e.ariaLabel, href:e.href, type:e.type, selector:e.selector})) };
+        pageTitle = res.title; pageUrl = res.url;
+        elements = res.elements;
+      } catch {
+        const r2 = await bridge.dom.listInteractive(tabId, { limit: 500 });
+        pageTitle = r2.title; pageUrl = r2.url;
+        const KIND_PREDICATE = {
+          all: () => true,
+          link: (e) => e.tag === "a" || e.role === "link",
+          button: (e) => e.tag === "button" || e.role === "button" || (e.tag === "input" && ["submit", "button", "reset"].includes(e.type)),
+          input: (e) => e.tag === "input" || ["textbox", "searchbox", "spinbutton"].includes(e.role),
+          select: (e) => e.tag === "select" || e.role === "combobox",
+          textarea: (e) => e.tag === "textarea",
+        };
+        elements = r2.elements.filter(KIND_PREDICATE[kind] || (() => true));
+      }
     }
 
     const needle = contains ? contains.trim().toLowerCase() : null;
@@ -1058,6 +1236,10 @@ export function registerTools(server, ctx) {
       elements = elements.filter((e) =>
         (e.name || "").toLowerCase().includes(needle)
         || (e.href || "").toLowerCase().includes(needle));
+    }
+    if (scope && scope.trim()) {
+      const scopeSel = scope.trim();
+      elements = elements.filter((e) => e.selector && (e.selector === scopeSel || e.selector.startsWith(scopeSel + " ") || e.selector.startsWith(scopeSel + ">") || e.selector.includes(scopeSel)));
     }
 
     return json({
@@ -1103,7 +1285,7 @@ export function registerTools(server, ctx) {
 
   // 17. execute_js
   server.tool("execute_js", "Run JavaScript in the page and return its result. Use `return` for a value; secrets in output are redacted unless redact=false. DANGER: requires confirm=true", {
-    code: z.string(),
+    code: z.string().max(20000),
     confirm: z.boolean().default(false),
     redact: z.boolean().default(true),
     tab_id: z.number().int().optional(),
@@ -1113,7 +1295,7 @@ export function registerTools(server, ctx) {
     }
     const trimmed = code.trim();
     const looksLikeFn = /^(async\s+function\b|function\b|async\s*\(|\(|[A-Za-z_$][\w$]*\s*=>)/.test(trimmed);
-    const source = looksLikeFn ? trimmed : `async () => {\n${code}\n}`;
+    const source = looksLikeFn ? trimmed : `async () => (${code})`;
     const result = await evalV(tab(tab_id), source);
     const text = JSON.stringify(result, null, 2) ?? "undefined";
     return { content: [{ type: "text", text: redact ? redactSecrets(text) : text }] };
@@ -1122,7 +1304,7 @@ export function registerTools(server, ctx) {
   // 18. inject_script
   server.tool("inject_script", "Register a named persistent script that replays on every navigation", {
     name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
-    code: z.string(),
+    code: z.string().max(20000),
     run_now: z.boolean().default(true),
   }, guard(async ({ name, code, run_now }) => {
     await bridge.injected.register(name, code);
@@ -1177,7 +1359,12 @@ export function registerTools(server, ctx) {
     active: z.boolean().default(true),
     background: z.boolean().default(false),
   }, guard(async ({ action, url, tab_id, window_id, active, background }) => {
-    assertSafeUrl(url ?? "https://example.invalid");
+    if (action === "open") {
+      if (!url) throw new Error('tabs action=open requires "url"');
+      assertSafeUrl(url);
+    } else if (url) {
+      assertSafeUrl(url);
+    }
     let result;
     switch (action) {
       case "list":
@@ -1279,22 +1466,26 @@ export function registerTools(server, ctx) {
     wikipedia: (q) => `https://en.wikipedia.org/w/index.php?search=${q}`,
   };
   server.tool("search", "Run a web search in the active tab and return the top results", {
-    query: z.string(),
+    query: z.string().min(1).max(500),
     platform: z.enum(["google", "bing", "duckduckgo", "brave", "youtube", "reddit", "github", "stackoverflow", "wikipedia"]).default("google"),
     region: z.string().optional(),
     limit: z.number().int().min(1).max(50).default(10),
   }, guard(async ({ query, platform, region, limit }) => {
     const enc = encodeURIComponent(query);
-    const url = SEARCH_URLS[platform](enc, region);
+    const rg = region ? encodeURIComponent(region) : undefined;
+    const url = SEARCH_URLS[platform](enc, rg);
     assertSafeUrl(url);
     await bridge.nav.goto(url, { waitUntil: "load" });
-    await sleep(800); // SPA shells paint results after load fires
+    const SENTINEL = { google: '#search', bing: '#b_results', duckduckgo: '[data-testid="result"]', brave: '#results', youtube: 'ytd-video-renderer', reddit: 'shreddit-post', github: '.search-title', wikipedia: '.mw-search-result', default: 'a[href]' };
+    const sel = SENTINEL[platform] || SENTINEL.default;
+    await bridge.dom.waitFor(tab(), sel, { timeoutMs: 2000 }).catch(() => {});
     const res = await evalV(tab(), pageSearchResults, [platform, limit]);
     addHistoryEntry({ url, title: `Search [${platform}]: ${query}`, tabId: bridge.currentTabId });
     return json({ query, platform, region: region ?? null, ...res });
   }));
 
-  // 28. search_tabs
+  // 28. search_tabs — F.3: idf WeakMap cache 5s TTL (avoid 2-5ms per query for 50 tabs)
+  let _idfCache = { docsKey: null, idf: null, ts: 0 };
   server.tool("search_tabs", "Search across all open tabs by title or URL (TF-IDF ranked)", {
     query: z.string(),
     limit: z.number().int().min(1).max(100).default(20),
@@ -1311,7 +1502,15 @@ export function registerTools(server, ctx) {
     if (!docs.length) return json([]);
     const qTokens = tokenize(query);
     if (!qTokens.length) throw new Error(`Query produced no searchable terms: "${query}"`);
-    const weights = idf(docs.map((d) => d.tokens));
+    const docsKey = docs.length + ":" + docs.map(d => d.id).join(",");
+    const now = Date.now();
+    let weights = null;
+    if (_idfCache.docsKey === docsKey && _idfCache.idf && (now - _idfCache.ts) < 5000) {
+      weights = _idfCache.idf;
+    } else {
+      weights = idf(docs.map((d) => d.tokens));
+      _idfCache = { docsKey, idf: weights, ts: now };
+    }
     const weighted = (tf) => {
       const out = new Map();
       for (const [term, freq] of tf) out.set(term, freq * (1 + (weights.get(term) || 0)));
@@ -1358,15 +1557,37 @@ export function registerTools(server, ctx) {
   server.tool("network_request", "Send an HTTP request through the browser profile (cookies/session apply)", {
     url: z.string().url(),
     method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]).default("GET"),
-    headers: z.record(z.string()).optional(),
-    body: z.string().optional(),
+    headers: z.record(z.string().max(512)).optional(),
+    body: z.string().max(200000).optional(),
     timeout_ms: z.number().int().min(1000).max(300000).default(20000),
   }, guard(async ({ url, method, headers, body, timeout_ms }) => {
     assertSafeUrl(url);
+    if (headers) {
+      for (const [k,v] of Object.entries(headers)) {
+        if (/[\r\n\0]/.test(k+v) || /^(host|content-length)$/i.test(k)) throw new Error(`blocked header ${k}`);
+      }
+    }
     return json(await bridge.http.request({ url, method, headers, body, timeoutMs: timeout_ms }));
   }));
 
-  // 33. cookies
+  // 33. handle_dialog — P0.2 ported from mcp-chrome MIT dialog.ts
+  server.tool("handle_dialog", "Accept or dismiss a JavaScript dialog (alert/confirm/prompt) via CDP Page.handleJavaScriptDialog", {
+    action: z.enum(["accept", "dismiss"]),
+    promptText: z.string().optional(),
+    tab_id: z.number().int().optional(),
+  }, guard(async ({ action, promptText, tab_id }) => {
+    return json(await bridge.dialog.handle({ action, promptText, tabId: tab_id ?? (await ensureTab()) }));
+  }));
+
+  // 34. handle_download — P0.2 ported from mcp-chrome MIT download.ts (polls chrome.downloads)
+  server.tool("handle_download", "Wait for a download to complete (optionally filter by filenameContains)", {
+    filenameContains: z.string().optional(),
+    timeout_ms: z.number().int().min(1000).max(300000).default(60000),
+  }, guard(async ({ filenameContains, timeout_ms }) => {
+    return json(await bridge.download.wait({ filenameContains, timeoutMs: timeout_ms }));
+  }));
+
+  // 35. cookies
   server.tool("cookies", "Get cookies (filter by domain/name), set cookies, delete/clear (auto-backup first), export/import encrypted snapshots", {
     action: z.enum(["get", "set", "delete", "clear", "export", "import"]).default("get"),
     cookies: z.array(z.object({
@@ -1443,6 +1664,14 @@ export function registerTools(server, ctx) {
           ? (isAbsolute(file) ? file : join(COOKIES_DIR, file))
           : readdirSync(COOKIES_DIR).filter((f) => f.endsWith(".json.enc")).sort().map((f) => join(COOKIES_DIR, f)).pop();
         if (!p) throw new Error(`No snapshot found in ${COOKIES_DIR}. Run cookies export first or pass "file".`);
+        {
+          const resolved = resolve(p);
+          const base = resolve(COOKIES_DIR);
+          if (resolved !== base && !resolved.startsWith(base + sep)) {
+            throw new Error(`Path traversal blocked: ${file} resolves outside ${COOKIES_DIR}`);
+          }
+          p = resolved;
+        }
         const payload = decryptCookies(JSON.parse(readFileSync(p, "utf8")));
         if (!Array.isArray(payload)) throw new Error(`Could not decrypt ${p} (wrong COOKIE_ENCRYPTION_KEY?)`);
         let restored = 0;
@@ -1544,15 +1773,18 @@ export function registerTools(server, ctx) {
     by_text: z.string().optional(),
     scope: z.string().optional(),
     ref: z.string().optional(),
-  }, guard(async ({ selector, by_text, scope, ref }) => {
-    return json(await performHover(tab(), { selector, by_text, scope, ref }));
+    x: z.number().optional(),
+    y: z.number().optional(),
+  }, guard(async ({ selector, by_text, scope, ref, x, y }) => {
+    return json(await performHover(tab(), { selector, by_text, scope, ref, x, y }));
   }));
 
-  // 40. computer — unified dispatcher over the same primitives
+  // 42. computer — unified dispatcher over the same primitives (P0.1: fill ref→selector scopeSel, hover cdp, viewport)
   server.tool("computer", "Unified interaction: click, double_click, right_click, move, type, fill, key, scroll, hover, wait, navigate, screenshot", {
     action: z.enum(["click", "double_click", "right_click", "move", "type", "fill", "key", "scroll", "hover", "wait", "navigate", "screenshot"]),
     selector: z.string().optional(),
     by_text: z.string().optional(),
+    scope: z.string().optional(),
     ref: z.string().optional(),
     text: z.string().optional(),
     x: z.number().optional(),
@@ -1563,6 +1795,9 @@ export function registerTools(server, ctx) {
     scroll_direction: z.enum(["up", "down", "left", "right"]).default("down"),
     scroll_amount: z.number().int().min(1).max(100000).default(800),
     delay: z.number().int().min(0).max(120000).default(0),
+    width: z.number().int().min(100).max(8000).optional(),
+    height: z.number().int().min(100).max(8000).optional(),
+    background: z.boolean().optional(),
   }, guard(async (a) => {
     const tabId = await ensureTab();
     switch (a.action) {
@@ -1572,6 +1807,7 @@ export function registerTools(server, ctx) {
         return json(await performClick(tabId, {
           selector: a.selector,
           byText: a.by_text,
+          scope: a.scope,
           ref: a.ref,
           x: a.x,
           y: a.y,
@@ -1587,13 +1823,14 @@ export function registerTools(server, ctx) {
           return json({ ok: true, mode: "cdp-trusted", x: center.x, y: center.y });
         }
         return json(await performHover(tabId, {
-          selector: a.selector, by_text: a.by_text, ref: a.ref, x: a.x, y: a.y,
+          selector: a.selector, by_text: a.by_text, scope: a.scope, ref: a.ref, x: a.x, y: a.y,
         }));
       }
       case "type":
       case "fill":
         return json(await performType(tabId, {
           selector: a.selector,
+          scope: a.scope,
           ref: a.ref,
           text: a.text || "",
           delayPerChar: a.action === "type" ? a.delay : 0,
@@ -1601,7 +1838,7 @@ export function registerTools(server, ctx) {
       case "key":
         return json(await performPressKey(tabId, { key: a.key || "Enter", times: 1, selector: a.selector }));
       case "scroll":
-        return json(await performScroll(tabId, { direction: a.scroll_direction, amount: a.scroll_amount }));
+        return json(await performScroll(tabId, { direction: a.scroll_direction, amount: a.scroll_amount, selector: a.selector, scope: a.scope }));
       case "wait": {
         const ms = a.delay || 1000;
         await sleep(ms);
@@ -1610,7 +1847,7 @@ export function registerTools(server, ctx) {
       case "navigate": {
         if (!a.url) throw new Error('computer action=navigate requires "url"');
         assertSafeUrl(a.url);
-        return json(await bridge.nav.goto(a.url, { waitUntil: "load", timeoutMs: 30000 }));
+        return json(await bridge.nav.goto(a.url, { waitUntil: "load", timeoutMs: 30000, width: a.width, height: a.height, background: a.background }));
       }
       case "screenshot":
         return json(await capturePng(tabId, { fullPage: false, selector: a.selector }));
@@ -1623,7 +1860,7 @@ export function registerTools(server, ctx) {
   server.tool("health", "Server status, connection transport, store sizes, live refs, and uptime", {}, guard(async () => {
     const state = await bridge.browser.state().catch(() => null);
     return json({
-      server: "browser-navigator v2.0.0",
+      server: "browser-navigator v2.0.9",
       connected: !!state,
       transport: bridge.transportName(),
       wsPort,

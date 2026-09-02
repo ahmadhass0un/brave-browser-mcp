@@ -6,7 +6,7 @@ import { join } from 'path';
 
 const dataDirs = ['cookies', 'bookmarks', 'history', 'screenshots'];
 const base = join(process.cwd(), 'data');
-for (const d of dataDirs) mkdirSync(join(base, d), { recursive: true });
+for (const d of dataDirs) mkdirSync(join(base, d), { recursive: true, mode: 0o700 });
 
 process.on('SIGINT', () => { shutdown(); process.exit(0); });
 process.on('SIGTERM', () => { shutdown(); process.exit(0); });
