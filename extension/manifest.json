@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Navigator MCP Bridge",
-  "version": "2.0.10",
+  "version": "2.0.11",
   "description": "Bridge between the browser-navigator MCP server and this browser.",
   "minimum_chrome_version": "118",
   "background": {

@@ -47,7 +47,7 @@ try {
 // ============================================================================
 
 const PROTOCOL_VERSION = 1;
-const EXT_VERSION = "2.0.10";
+const EXT_VERSION = "2.0.11";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
 const SERVER_PROBE_INTERVAL_MS = 2_000; // poll for the MCP server while it's down
 
@@ -618,10 +618,12 @@ async function connectLoop() {
   try {
     await loadSettings();
     const url = (typeof settingsCache.serverUrl === 'string' && settingsCache.serverUrl) ? settingsCache.serverUrl : DEFAULT_SERVER_URL;
-    // Cold start: probe the health endpoint first so a down server never
-    // triggers Chrome's uncatchable ERR_CONNECTION_REFUSED WebSocket log.
-    if (!everWelcomed && !(await serverUp(url))) {
-      log("server down at boot — entering probe mode");
+    // Always probe first so a down server never triggers Chrome's
+    // uncatchable ERR_CONNECTION_REFUSED WebSocket log (background.js:647).
+    // Previously only checked on cold boot (!everWelcomed), so a server that
+    // died after being connected would still spam WebSocket attempts.
+    if (!(await serverUp(url))) {
+      log("server down — entering probe mode (no WebSocket dial)");
       startProbing();
       return;
     }

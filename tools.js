@@ -1,6 +1,6 @@
 /**
  * browser-navigator — tools.js
- * Registers all 43 MCP tools on an McpServer instance. v2.0.10 CSP-safe.
+ * Registers all 43 MCP tools on an McpServer instance. v2.0.11 CSP-safe.
  */
 
 import { z } from "zod";
@@ -1956,10 +1956,10 @@ export function registerTools(server, ctx) {
   }));
 
   // 41. health
-  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.10, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
+  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.11, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
     const state = await bridge.browser.state().catch(() => null);
     return json({
-      server: "browser-navigator v2.0.10",
+      server: "browser-navigator v2.0.11",
       connected: !!state,
       transport: bridge.transportName(),
       wsPort,
