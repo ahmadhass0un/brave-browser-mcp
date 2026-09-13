@@ -1,6 +1,6 @@
 /**
  * browser-navigator — tools.js
- * Registers all 43 MCP tools on an McpServer instance. v2.0.11 CSP-safe.
+ * Registers all 43 MCP tools on an McpServer instance. v2.0.12 CSP-safe.
  */
 
 import { z } from "zod";
@@ -900,7 +900,7 @@ export function registerTools(server, ctx) {
   // -------------------------------------------------------------------------
 
   // 1. connect_brave
-  server.tool("connect_brave", "FIRST CALL: establish WebSocket to the Brave extension (ws://127.0.0.1:9224) and return live browser state. Call before any tab/page tools. No args. Returns windowCount, tabCount, activeTabId, activeWindowId, transport, sessionId, and next_step hint (run read_page). Retries automatically if extension not yet ready.", {},
+  server.tool("connect_brave", "FIRST CALL: establish WebSocket to the Brave extension (ws://127.0.0.1:9224) and return live browser state. Call before any tab/page tools. No args. Returns windowCount, tabCount, activeTabId, activeWindowId, transport, sessionId, and next_step hint (run read_page). Retries automatically if extension not yet ready. NOTE: for tests/automation, open a fresh tab via tabs {action:\"open\", url:\"https://example.com\"} and use tab_id for all subsequent calls to avoid hijacking the user's active tab.", {},
     guard(async () => {
       const state = await bridge.browser.state();
       bridge.drainRecentEvents(); // stale events from a previous session are noise
@@ -925,7 +925,7 @@ export function registerTools(server, ctx) {
     }));
 
   // 3. navigate — P0.2 adds width/height viewport passthrough (keep BN perf, no extra hops)
-  server.tool("navigate", "Navigate a tab to a URL and wait until it settles. Requires connect_brave first. Args: url (https:// only, SSRF-blocked), wait_until (commit|domcontentloaded|load|networkidle, default load), timeout_ms 1s-120s, tab_id optional (defaults to active tab), background (true opens new background tab), width/height (viewport resize 100-8000). Returns tabId/url/title/status/elapsedMs. Auto-saves to history.", {
+  server.tool("navigate", "Navigate a tab to a URL and wait until it settles. Requires connect_brave first. Args: url (https:// only, SSRF-blocked), wait_until (commit|domcontentloaded|load|networkidle, default load), timeout_ms 1s-120s, tab_id optional (defaults to active tab), background (true opens new background tab), width/height (viewport resize 100-8000). Returns tabId/url/title/status/elapsedMs. Auto-saves to history. ISOLATION: for tests/automation always use background:true or tabs {action:\"open\"} + tab_id to avoid hijacking the user's active tab.", {
     url: z.string().url(),
     wait_until: z.enum(["commit", "domcontentloaded", "load", "networkidle"]).default("load"),
     timeout_ms: z.number().int().min(1000).max(120000).default(30000),
@@ -1555,7 +1555,7 @@ export function registerTools(server, ctx) {
     stackoverflow: (q) => `https://stackoverflow.com/search?q=${q}`,
     wikipedia: (q) => `https://en.wikipedia.org/w/index.php?search=${q}`,
   };
-  server.tool("search", "Search the web via the active tab (navigates there). Args: query 1-500 chars (required), platform (google|bing|duckduckgo|brave|youtube|reddit|github|stackoverflow|wikipedia), region optional (country code), limit 1-50. Encodes region, uses platform-specific SERP selectors (not hard-coded X selector), waits 2s sentinel. Returns results[{title,url,snippet}], serpTitle/Url, count. Auto-saves to history.", {
+  server.tool("search", "Search the web via the active tab (navigates there). Args: query 1-500 chars (required), platform (google|bing|duckduckgo|brave|youtube|reddit|github|stackoverflow|wikipedia), region optional (country code), limit 1-50. Encodes region, uses platform-specific SERP selectors (not hard-coded X selector), waits 2s sentinel. Returns results[{title,url,snippet}], serpTitle/Url, count. Auto-saves to history. ISOLATION: hijacks active tab — for tests use background tab via navigate+extractSearchResults or open a new tab first.", {
     query: z.string().min(1).max(500),
     platform: z.enum(["google", "bing", "duckduckgo", "brave", "youtube", "reddit", "github", "stackoverflow", "wikipedia"]).default("google"),
     region: z.string().optional(),
@@ -1956,10 +1956,10 @@ export function registerTools(server, ctx) {
   }));
 
   // 41. health
-  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.11, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
+  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.12, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
     const state = await bridge.browser.state().catch(() => null);
     return json({
-      server: "browser-navigator v2.0.11",
+      server: "browser-navigator v2.0.12",
       connected: !!state,
       transport: bridge.transportName(),
       wsPort,
