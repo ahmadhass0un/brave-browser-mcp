@@ -1,6 +1,6 @@
 /**
  * browser-navigator — tools.js
- * Registers all 43 MCP tools on an McpServer instance.
+ * Registers all 43 MCP tools on an McpServer instance. v2.0.10 CSP-safe.
  */
 
 import { z } from "zod";
@@ -820,7 +820,12 @@ export function registerTools(server, ctx) {
   async function capturePng(tabId, { fullPage = false, selector, savePath } = {}) {
     const params = { format: "png", captureBeyondViewport: !!fullPage, optimizeForSpeed: true };
     if (selector) {
-      const r = await evalV(tabId, pageRectOf, [selector]);
+      let r;
+      try {
+        r = await contentExec(tabId, "measureRect", { selector });
+      } catch {
+        r = await evalV(tabId, pageRectOf, [selector]);
+      }
       if (!r.width || !r.height) throw new Error(`Element ${selector} has no size`);
       params.clip = { x: Math.round(r.x), y: Math.round(r.y), width: r.width, height: r.height, scale: 1 };
       if (params.clip.width <= 0 || params.clip.height <= 0) throw new Error(`Invalid clip for ${selector}`);
@@ -960,16 +965,26 @@ export function registerTools(server, ctx) {
     return json(result);
   }));
 
-  // 4. navigate_history
+  // 4. navigate_history — CSP-safe: tabs.goBack/goForward via history.navigate, content fallback, cs.eval last
   server.tool("navigate_history", "Navigate session history like browser Back/Forward. Requires active tab. Args: direction (back|forward, default back), steps 1-50. Uses history.go() then 400ms settle. Returns new url/title. Saved to history.", {
     direction: z.enum(["back", "forward"]).default("back"),
     steps: z.number().int().min(1).max(50).default(1),
   }, guard(async ({ direction, steps }) => {
     const tabId = await ensureTab();
     const delta = direction === "back" ? -steps : steps;
-    const result = await evalV(tabId,
-      "(d) => { history.go(d); return new Promise((res) => setTimeout(() => res({ url: location.href, title: document.title }), 400)); }",
-      [delta]);
+    let result;
+    try {
+      result = await bridge.history.navigate(tabId, delta);
+    } catch {}
+    if (!result) {
+      try {
+        result = await contentExec(tabId, "navigateHistory", { delta });
+      } catch {
+        result = await evalV(tabId,
+          "(d) => { history.go(d); return new Promise((res) => setTimeout(() => res({ url: location.href, title: document.title }), 400)); }",
+          [delta]);
+      }
+    }
     addHistoryEntry({ url: result.url || "", title: result.title || "", tabId });
     return json(result);
   }));
@@ -1273,7 +1288,7 @@ export function registerTools(server, ctx) {
     });
   }));
 
-  // 14. inspect_dom
+  // 14. inspect_dom — CSP-safe: content.js inspectDom first, cs.eval fallback for non-injected pages
   server.tool("inspect_dom", "Deep inspect single element: tag, id, classes, attributes (truncated), cssPath, rect, visible, child subtree, optional HTML. Args: selector or by_text + scope, max_depth 1-10, include_html bool. Resolves by_text → selector first. Returns tree + html. Use to debug selector or inspect hidden attributes.", {
     selector: z.string().optional(),
     by_text: z.string().optional(),
@@ -1281,17 +1296,21 @@ export function registerTools(server, ctx) {
     max_depth: z.number().int().min(1).max(10).default(3),
     include_html: z.boolean().default(false),
   }, guard(async ({ selector, by_text, scope, max_depth, include_html }) => {
-    let target = resolveTarget({ selector, by_text, scope });
+    const target = resolveTarget({ selector, by_text, scope });
     if (!target) throw new Error("inspect_dom needs selector or by_text");
-    if (target.byText != null) {
-      // content.js inspectDom supports byText + scope natively (CSP-safe); fall
-      // back to text→selector resolution via eval when content script is absent
-      try {
+    // Prefer CSP-safe content.js path (isolated world, no eval string → bypasses page CSP + MV3 'unsafe-eval')
+    try {
+      if (target.byText != null) {
         return json(await contentExec(tab(), "inspectDom", { byText: target.byText, scope: target.scope ?? undefined, max_depth, include_html }));
-      } catch {
-        const loc = await evalV(tab(), pageLocateByText, [target.byText]); // resolve text -> reusable selector
-        target = { selector: loc.selector };
       }
+      if (target.selector) {
+        return json(await contentExec(tab(), "inspectDom", { selector: target.selector, max_depth, include_html }));
+      }
+    } catch {}
+    // Fallback to cs.eval for pages without content script (chrome://, pdf)
+    if (target.byText != null) {
+      const loc = await evalV(tab(), pageLocateByText, [target.byText]);
+      return json(await evalV(tab(), pageInspectDeep, [{ selector: loc.selector }, max_depth, include_html]));
     }
     return json(await evalV(tab(), pageInspectDeep, [target, max_depth, include_html]));
   }));
@@ -1312,7 +1331,7 @@ export function registerTools(server, ctx) {
     return json(await exportPdf(tab(), { savePath: save_path }));
   }));
 
-  // 17. execute_js
+  // 17. execute_js — CSP-safe: content.js evaluateJs → debugger Runtime.evaluate (bypasses MV3 unsafe-eval), cs.eval last
   server.tool("execute_js", "Execute arbitrary JavaScript in page ISOLATED world and return JSON result. DANGER — requires confirm=true. Args: code string max 20000 (wrap with return for value, or async () => ... auto-detected), confirm bool must be true, redact bool (default true hides passwords/tokens), tab_id optional. Returns stringified result. Bypasses page CSP. Use for custom DOM queries or site-specific hacks.", {
     code: z.string().max(20000),
     confirm: z.boolean().default(false),
@@ -1322,6 +1341,16 @@ export function registerTools(server, ctx) {
     if (!confirm) {
       return { content: [{ type: "text", text: "Refused: execute_js is destructive. Re-run with confirm=true to proceed." }] };
     }
+    try {
+      const r = await contentExec(tab(tab_id), "evaluateJs", { code });
+      const text = r.text != null ? r.text : JSON.stringify(r.value ?? r, null, 2) ?? "undefined";
+      return { content: [{ type: "text", text: redact ? redactSecrets(text) : text }] };
+    } catch {}
+    try {
+      const r = await bridge.js.evaluate(tab(tab_id), code);
+      const text = r.text != null ? r.text : JSON.stringify(r.value ?? r, null, 2) ?? "undefined";
+      return { content: [{ type: "text", text: redact ? redactSecrets(text) : text }] };
+    } catch {}
     const trimmed = code.trim();
     const looksLikeFn = /^(async\s+function\b|function\b|async\s*\(|\(|[A-Za-z_$][\w$]*\s*=>)/.test(trimmed);
     const source = looksLikeFn ? trimmed : `async () => (${code})`;
@@ -1352,7 +1381,7 @@ export function registerTools(server, ctx) {
     return json(await bridge.injected.send(name, data ?? null, { timeoutMs: timeout_ms }));
   }));
 
-  // 20. wait_for
+  // 20. wait_for — CSP-safe: content.js waitForSelector first, cs.eval fallback
   server.tool("wait_for", "Wait for element to appear (MutationObserver, no polling). Args: selector or text or ref (ref_N from read_page), interval_ms 100-5000 (ignored, kept for compat), timeout_ms 500-120000. Returns found bool, elapsedMs, or TIMEOUT error. Use before clicking dynamically loaded content. Note: text must be leaf-node exact-ish.", {
     selector: z.string().optional(),
     text: z.string().optional(),
@@ -1361,13 +1390,24 @@ export function registerTools(server, ctx) {
     timeout_ms: z.number().int().min(500).max(120000).default(10000),
   }, guard(async ({ selector, text, ref, interval_ms, timeout_ms }) => {
     let target;
+    let selectorStr = null;
     if (ref != null) {
       const info = bridge.resolveRef(ref);
       if (!info?.selector) throw new Error(`Unknown ref "${ref}" — run read_page to refresh refs`);
       target = { selector: info.selector };
-    } else if (selector) target = selector;
-    else if (text != null) target = { text };
+      selectorStr = info.selector;
+    } else if (selector) {
+      target = selector;
+      selectorStr = selector;
+    } else if (text != null) target = { text };
     else throw new Error("wait_for needs selector, text, or ref");
+    // Prefer CSP-safe content.js path for selector-based waits (bypasses MV3 unsafe-eval block)
+    if (selectorStr) {
+      try {
+        const c = await contentExec(tab(), "waitForSelector", { selector: selectorStr, timeoutMs: timeout_ms });
+        return json({ ok: true, found: !!c.found, selector: selectorStr, elapsedMs: 0, via: "content" });
+      } catch {}
+    }
     return json(await bridge.dom.waitFor(tab(), target, { timeoutMs: timeout_ms, intervalMs: interval_ms }));
   }));
 
@@ -1448,9 +1488,14 @@ export function registerTools(server, ctx) {
     return json(result);
   }));
 
-  // 24. detect_captcha
+  // 24. detect_captcha — CSP-safe: content.js detectCaptcha first, cs.eval fallback
   server.tool("detect_captcha", "Detect CAPTCHA presence via selector checks (no heavy outerHTML). Returns detected bool, kind (recaptcha|hcaptcha|turnstile|geetest|funcaptcha|unknown), signals, frameCount. Quick CSP-friendly version of content.js detect. Check before automated form submit.", {},
     guard(async () => {
+      try {
+        const c = await contentExec(tab(), "detectCaptcha", {});
+        const res = { ok: true, detected: !!c.detected, kind: c.type ?? null, signals: [], frameCount: 0 };
+        return json(res.detected ? { ...res, hint: "Run wait_for_captcha after the user solves it." } : res);
+      } catch {}
       const res = await bridge.dom.detectCaptcha(tab());
       return json(res.detected
         ? { ...res, hint: "Run wait_for_captcha after the user solves it." }
@@ -1464,12 +1509,27 @@ export function registerTools(server, ctx) {
     return json(await bridge.captcha.wait({ timeoutMs: timeout_ms }));
   }));
 
-  // 26. video_control
+  // 26. video_control — CSP-safe: content.js videoControl first, cs.eval fallback for legacy pageVideoExtra
   server.tool("video_control", "Control largest visible <video>/<audio> on page. Args: action (play|pause|toggle|mute|unmute|seek|set_speed|set_volume|fullscreen|exit_fullscreen|get_info), value (seconds for seek 0-duration, 0-1 for volume, playbackRate for speed). Returns state {currentTime,duration,paused,muted,volume,playbackRate}. Note: seek clamps, play may fail if autoplay blocked.", {
     action: z.enum(["play", "pause", "toggle", "mute", "unmute", "seek", "set_speed", "set_volume", "fullscreen", "exit_fullscreen", "get_info"]),
     value: z.union([z.number(), z.string()]).optional(),
   }, guard(async ({ action, value }) => {
     const tabId = await ensureTab();
+    const CONTENT_MAP = { play: "play", pause: "pause", toggle: "pause", mute: "mute", unmute: "unmute", seek: "seek", set_volume: "volume", set_speed: "rate", fullscreen: "fullscreen" };
+    if (action in CONTENT_MAP) {
+      try {
+        const cAction = CONTENT_MAP[action];
+        const cValue = action === "seek" ? Number(value ?? 0) : action === "set_volume" ? Number(value ?? 1) : action === "set_speed" ? Number(value ?? 1) : undefined;
+        const r = await contentExec(tabId, "videoControl", cValue != null ? { action: cAction, value: cValue } : { action: cAction });
+        return json(r);
+      } catch {}
+    }
+    if (action === "get_info") {
+      try {
+        const st = await contentExec(tabId, "getState", {});
+        return json({ ok: true, videoPresent: !!st.videoPresent, hasVideo: !!st.videoPresent });
+      } catch {}
+    }
     const BRIDGE_ACTIONS = new Set(["play", "pause", "toggle", "mute", "unmute"]);
     if (BRIDGE_ACTIONS.has(action)) {
       return json(await bridge.dom.videoControl(tabId, action, null));
@@ -1508,8 +1568,17 @@ export function registerTools(server, ctx) {
     await bridge.nav.goto(url, { waitUntil: "load" });
     const SENTINEL = { google: '#search', bing: '#b_results', duckduckgo: '[data-testid="result"]', brave: '#results', youtube: 'ytd-video-renderer', reddit: 'shreddit-post', github: '.search-title', wikipedia: '.mw-search-result', default: 'a[href]' };
     const sel = SENTINEL[platform] || SENTINEL.default;
-    await bridge.dom.waitFor(tab(), sel, { timeoutMs: 2000 }).catch(() => {});
-    const res = await evalV(tab(), pageSearchResults, [platform, limit]);
+    try {
+      await contentExec(tab(), "waitForSelector", { selector: sel, timeoutMs: 2000 });
+    } catch {
+      await bridge.dom.waitFor(tab(), sel, { timeoutMs: 2000 }).catch(() => {});
+    }
+    let res;
+    try {
+      res = await contentExec(tab(), "extractSearchResults", { platform, limit });
+    } catch {
+      res = await evalV(tab(), pageSearchResults, [platform, limit]);
+    }
     addHistoryEntry({ url, title: `Search [${platform}]: ${query}`, tabId: bridge.currentTabId });
     return json({ query, platform, region: region ?? null, ...res });
   }));
@@ -1887,10 +1956,10 @@ export function registerTools(server, ctx) {
   }));
 
   // 41. health
-  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.9, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
+  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.10, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
     const state = await bridge.browser.state().catch(() => null);
     return json({
-      server: "browser-navigator v2.0.9",
+      server: "browser-navigator v2.0.10",
       connected: !!state,
       transport: bridge.transportName(),
       wsPort,

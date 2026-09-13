@@ -320,6 +320,14 @@ export const dbg = {
     call("dbg.cmd", { tabId, method, params }, opts),
 };
 
+export const history = {
+  navigate: (tabId, delta) => call("history.navigate", { tabId, delta }),
+};
+
+export const js = {
+  evaluate: (tabId, code) => call("js.evaluate", { tabId, code }),
+};
+
 export const browser = {
   state: () => call("browser.state"),
 };

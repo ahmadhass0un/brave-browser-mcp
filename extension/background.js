@@ -47,7 +47,7 @@ try {
 // ============================================================================
 
 const PROTOCOL_VERSION = 1;
-const EXT_VERSION = "2.0.9";
+const EXT_VERSION = "2.0.10";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
 const SERVER_PROBE_INTERVAL_MS = 2_000; // poll for the MCP server while it's down
 
@@ -516,9 +516,15 @@ function setLastError(text) {
 // uncatchable "ERR_CONNECTION_REFUSED" console line per retry. Instead we poll
 // the server's HTTP health endpoint with fetch (whose failures we suppress)
 // and only open the WebSocket once the server is actually up.
+//
+// MV3 wrinkle: the SW suspends after ~30s idle, killing all timers — including
+// probeTimer. chrome.alarms survives suspension and wakes us every 30s, so
+// the alarm handler is the authoritative "is the server up yet?" check.
 
 let probeTimer = null;
 let probing = false;
+
+const SERVER_ALARMS_WAKE = "mcp-server-wake";
 
 /** WS url -> http(s) health url (ws://127.0.0.1:9224 → http://127.0.0.1:9224/health). */
 function probeUrlOf(wsUrl) {
@@ -547,27 +553,42 @@ async function serverUp(wsUrl) {
   finally { clearTimeout(timer); }
 }
 
+async function probeTick() {
+  if (!chrome.runtime?.id) { stopProbing(); return; }
+  if (isOpen(ws) || connectInFlight) return;
+  const url = settingsCache.serverUrl || DEFAULT_SERVER_URL;
+  if (await serverUp(url)) {
+    log("server probe: up — dialing");
+    stopProbing();
+    reconnectAttempts = 0;
+    connectLoop();
+  }
+}
+
 function startProbing() {
-  if (probeTimer) return;
   probing = true;
-  probeTimer = setInterval(async () => {
-    if (!chrome.runtime?.id) { stopProbing(); return; }
-    if (isOpen(ws) || connectInFlight) return;
-    const url = settingsCache.serverUrl || DEFAULT_SERVER_URL;
-    if (await serverUp(url)) {
-      log("server probe: up — dialing");
-      stopProbing();
-      reconnectAttempts = 0;
-      connectLoop();
-    }
-  }, SERVER_PROBE_INTERVAL_MS);
-  probeTimer.unref?.();
+  if (!probeTimer) {
+    probeTimer = setInterval(() => { void probeTick(); }, SERVER_PROBE_INTERVAL_MS);
+  }
+  // MV3: setInterval dies with SW suspension; chrome.alarms persists in the
+  // browser and wakes the SW, so a server started while we sleep is still
+  // detected within one alarm period (30s on Chrome 120+, 1min on 118/119).
+  try { chrome.alarms.create(SERVER_ALARMS_WAKE, { periodInMinutes: 0.5 }); } catch { /* no alarms API */ }
 }
 
 function stopProbing() {
   probing = false;
   if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
+  try { chrome.alarms.clear(SERVER_ALARMS_WAKE); } catch { /* noop */ }
 }
+
+// Wakes the SW after suspension while the server is down. On wake the whole
+// module re-runs (init → connectLoop → probe gate), so this handler only needs
+// to cover the awake-but-idle corner (e.g. alarm fired between probe ticks).
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm?.name !== SERVER_ALARMS_WAKE) return;
+  if (!wsReady && !isOpen(ws) && !connectInFlight) connectLoop();
+});
 
 function teardownSocket(reason) {
   if (reason) setLastError(reason);
@@ -789,6 +810,8 @@ const HANDLERS = {
   // Navigation
   "nav.goto": hNavGoto,
   "nav.waitReady": hNavWaitReady,
+  "history.navigate": hHistoryNavigate,
+  "js.evaluate": hJsEvaluate,
 
   // Content-script eval
   "cs.eval": hCsEval,
@@ -836,6 +859,7 @@ const ALLOWED_CDP_METHODS = new Set([
   "Accessibility.getFullAXTree",
   "DOM.getDocument",
   "DOM.resolveNode",
+  "Runtime.evaluate",
   "Network.enable",
   "Network.disable",
   "Network.getResponseBody",
@@ -1628,6 +1652,52 @@ async function hNavWaitReady(args) {
   const timeoutMs = optNum(args, "timeoutMs", DEFAULT_OP_TIMEOUT_MS, 1000, 300_000);
   const settled = await waitTabSettled(tabId, until, timeoutMs);
   return ok({ ...settled, until });
+}
+
+async function hHistoryNavigate(args) {
+  const tabId = reqNum(args, "tabId");
+  const delta = Math.trunc(Number(args.delta ?? args.steps ?? -1));
+  if (!Number.isFinite(delta) || delta === 0) throw rpcErr(ERR.BAD_REQUEST, "delta must be non-zero integer");
+  await getTabOrThrow(tabId);
+  // Prefer tabs.goBack/goForward (CSP-safe, no eval) — fall back to history.go via debugger if needed
+  try {
+    if (delta < 0) {
+      for (let i = 0; i < Math.abs(delta); i++) await cbp(chrome.tabs.goBack.bind(chrome.tabs), tabId);
+    } else {
+      for (let i = 0; i < delta; i++) await cbp(chrome.tabs.goForward.bind(chrome.tabs), tabId);
+    }
+  } catch (e) {
+    // Fallback via debugger Runtime.evaluate for tabs where goBack not supported
+    const code = `history.go(${delta}); location.href`;
+    try {
+      await withDebugger(tabId, async (tid) => {
+        await cdpSend(tid, "Runtime.evaluate", { expression: code, awaitPromise: true });
+      });
+    } catch {}
+  }
+  await sleep(400);
+  const tab = await getTabOrThrow(tabId);
+  return ok({ url: tab.url || tab.pendingUrl || "", title: tab.title || "", delta });
+}
+
+async function hJsEvaluate(args) {
+  const tabId = reqNum(args, "tabId");
+  const code = optStr(args, "code") ?? optStr(args, "expression");
+  if (!code || !code.trim()) throw rpcErr(ERR.BAD_REQUEST, "code is required");
+  if (code.length > 20000) throw rpcErr(ERR.BAD_REQUEST, "code too long");
+  await getTabOrThrow(tabId);
+  const expr = code.trim();
+  // Use debugger Runtime.evaluate (bypasses both page CSP and extension_pages CSP)
+  return withDebugger(tabId, async (tid) => {
+    const res = await cdpSend(tid, "Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true });
+    if (res.exceptionDetails) {
+      throw rpcErr(ERR.EVAL_FAILED, res.exceptionDetails.exception?.description || res.exceptionDetails.text || "evaluate failed");
+    }
+    const val = res.result?.value;
+    let text;
+    try { text = JSON.stringify(val, null, 2); } catch { text = String(val); }
+    return ok({ value: val, text: (text ?? String(val)).slice(0, 200000) });
+  });
 }
 
 // ---- Content-script eval --------------------------------------------------------

@@ -32,6 +32,10 @@
     button: 'button, [role="button"], [role="tab"], input[type="button"], input[type="submit"], input[type="reset"]',
     link: 'a, [role="link"]',
     input: 'input:not([type="button"]):not([type="submit"]):not([type="reset"]), select, textarea, [contenteditable="true"], [contenteditable=""]',
+    select: 'select',
+    textarea: 'textarea, [contenteditable="true"], [contenteditable=""]',
+    image: 'img, [role="img"], svg',
+    heading: 'h1, h2, h3, h4, h5, h6, [role="heading"]',
   };
 
   const KEY_ALIASES = {
@@ -935,6 +939,91 @@
     };
   }
 
+  async function navigateHistory(args = {}) {
+    const delta = Math.trunc(num(args.delta, -1));
+    if (!Number.isFinite(delta) || delta === 0) throw fail('delta must be non-zero integer');
+    if (Math.abs(delta) > 50) throw fail('delta magnitude > 50 blocked');
+    history.go(delta);
+    await sleep(400);
+    return { url: location.href, title: document.title, delta };
+  }
+
+  async function evaluateJs(args = {}) {
+    const code = String(args.code ?? '');
+    if (!code.trim()) throw fail('code is required');
+    if (code.length > 20000) throw fail('code too long (max 20000)');
+    // CSP-safe: Function constructor is available in isolated world (bypasses page CSP),
+    // and unlike background's `new Function` wrapper it is not blocked by extension_pages CSP.
+    let fn;
+    const looksLikeFn = /^(async\s+function\b|function\b|async\s*\(|\(|[A-Za-z_$][\w$]*\s*=>)/.test(code.trim());
+    const src = looksLikeFn ? code.trim() : `return (${code})`;
+    try {
+      fn = new Function(src);
+    } catch (e) {
+      throw fail(`syntax error: ${e.message}`);
+    }
+    const result = await fn();
+    // stringify safely — truncate large results
+    try {
+      const text = JSON.stringify(result, null, 2);
+      return { value: result, text: (text ?? String(result)).slice(0, 200000), truncated: (text?.length || 0) > 200000 };
+    } catch {
+      return { value: String(result).slice(0, 200000) };
+    }
+  }
+
+  async function extractSearchResults(args = {}) {
+    const platform = String(args.platform || 'google').toLowerCase();
+    const limit = Math.max(1, Math.floor(num(args.limit, 10)));
+    const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+    const results = [];
+    const seen = new Set();
+    const RULES = {
+      google: { sel: ["#search a h3", "#rso a h3"], skip: /(^|\.)google\./i, snippet: ".VwiC3b" },
+      bing: { sel: ["#b_results li.b_algo h2 a", "#b_results h2 a"], skip: /(^|\.)bing\.com/i, snippet: ".b_caption p" },
+      duckduckgo: { sel: ["[data-testid='result'] a[data-testid='result-title-a']","article[data-layout='organic'] a[data-testid='result-title-a']","a.result__a","article h2 a[href^='http']"], skip: /duckduckgo\.com/i, snippet: "[data-result='snippet']" },
+      brave: { sel: ["#results .snippet[data-type='web'] a.heading-serpresult", "#results [data-type='web'] a", ".snippet[data-type='web'] a"], skip: /search\.brave\.com/i, snippet: ".snippet-description, .desc" },
+      youtube: { sel: ["ytd-video-renderer a#video-title","ytd-grid-video-renderer a#video-title","ytd-compact-video-renderer a#video-title","a#video-title-link","yt-lockup-view-model a"], accept: /(youtube\.com\/(watch|shorts)|youtu\.be\/)/i },
+      reddit: { sel: ["shreddit-post a[slot='title']","faceplate-tracker[nundle] a[slot='title']","a[data-testid='post-title']","a[href*='/comments/']"], accept: /reddit\.com\/r\//i },
+      github: { sel: ["div.search-title a", "[data-testid='results-list'] div.search-title a", "a.v-align-middle"], skip: /github\.com\/(features|pricing|about|topics|collections|trending|sponsors|security|login|signup|marketplace)/i },
+      stackoverflow: { sel: [".s-post-summary--content-title a", ".result-link"], accept: /\/questions\/\d+/i },
+      wikipedia: { sel: [".mw-search-result-heading a", "li.mw-search-result a"], accept: /\/wiki\//i, skip: /(Special%3A|Wikipedia%3A|File%3A|Talk%3A|Help%3A|Category%3A|Template%3A|Portal%3A)/i },
+    };
+    const push = (a) => {
+      if (!a || !a.href) return;
+      let u; try { u = new URL(a.href, location.href); } catch { return; }
+      if (u.protocol !== "http:" && u.protocol !== "https:") return;
+      const rule = RULES[platform];
+      if (rule) { if (rule.accept && !rule.accept.test(u.href)) return; if (rule.skip && rule.skip.test(u.href)) return; }
+      const title = clean(a.getAttribute("aria-label") || a.textContent || a.title);
+      if (title.length < 2) return;
+      const key = u.origin + u.pathname + u.search;
+      if (seen.has(key)) return;
+      let snippet = null;
+      const card = a.closest("div,li,article");
+      if (card) { const node = (rule && rule.snippet ? card.querySelector(rule.snippet) : null) || card.querySelector("p"); if (node && !node.contains(a)) snippet = clean(node.textContent).slice(0,300) || null; }
+      seen.add(key);
+      results.push({ title: title.slice(0,200), url: u.href.split("#")[0], snippet });
+    };
+    const qsa = (sel) => { try { return [...document.querySelectorAll(sel)]; } catch { return []; } };
+    const rule = RULES[platform];
+    let anchors = [];
+    if (rule) {
+      for (const s of rule.sel) { anchors = qsa(s); if (anchors.length >= Math.min(limit,5)) break; }
+      for (const a of anchors) { if (results.length >= limit) break; push(a); }
+    }
+    if (results.length < limit) {
+      const engineSelf = /(^|\.)(google|bing\.com|duckduckgo|brave\.com|youtube|reddit|github|stackoverflow|wikipedia)/i;
+      const fallbackAnchors = qsa("a[href]").slice(0,500);
+      for (const a of fallbackAnchors) {
+        if (results.length >= limit) break;
+        if (!(rule && rule.accept)) { const t = clean(a.textContent); if (t.length < 25) continue; try { const u = new URL(a.href, location.href); if (u.protocol !== "http:" && u.protocol !== "https:") continue; if (engineSelf.test(u.hostname)) continue; } catch { continue; } }
+        push(a);
+      }
+    }
+    return { ok: true, platform, count: results.length, results: results.slice(0,limit), serpTitle: document.title, serpUrl: location.href };
+  }
+
   async function scrollPage(args = {}) {
     const dir = String(args.direction || 'down');
     if (!['up','down','left','right'].includes(dir)) throw fail('direction must be up|down|left|right');
@@ -969,6 +1058,9 @@
     measureRect,
     getState,
     scrollPage,
+    navigateHistory,
+    evaluateJs,
+    extractSearchResults,
   };
 
   async function handleOp(op, args) {
