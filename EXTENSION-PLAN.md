@@ -7,7 +7,7 @@
 │ LLM      │◄───────►│ MCP Server (Node.js)            │
 │ (Opencode)│        │  server.js → tools.js → bridge.js│
 └──────────┘         │       ↕ ws-server.js (WS:9224)  │
-                     │       ↕ native-host.js (fallback)│
+                     │          + GET /health → 204     │
                      └──────────────┬──────────────────┘
                                     │ WebSocket
                                     ▼
@@ -42,39 +42,37 @@ extension/
 ```
 > `options.html`/`options.js` removed — functionality merged into `dashboard.html` `#page-settings` (single place). `manifest.json` `options_page` now points to `dashboard.html`.
 
-### Permissions (current `extension/manifest.json:8`)
+### Permissions (current `extension/manifest.json:11`)
 - `tabs`, `windows`, `scripting` — tab/window management, DOM injection
 - `debugger` — accessibility tree (`read_page`), screenshots, PDF, trusted input
 - `cookies` — cookie save/load across all sites
-- `webRequest` — networkidle detection (observational only)
 - `storage` — injected-script registry, settings persistence
-- `nativeMessaging` — fallback transport (ws preferred)
+- `downloads` — `handle_download` tool (`chrome.downloads` polling)
 - `host_permissions: ["<all_urls>"]` — content scripts on arbitrary sites, CORS-free fetch, debugger attachment
 
 ### Not needed
 - `activeTab` — calls arrive from MCP server, not user gestures
-- `webRequestBlocking` — not available in MV3 store extensions
-- `downloads` — server writes files itself
+- `webRequest` — removed (networkidle detection is not used; captures use CDP Network/Fetch domains)
+- `nativeMessaging` — removed (WS-only transport)
 - `bookmarks`/`history` — server-owned JSON stores (`data/bookmarks`, `data/history`)
-- `history` permission — removed (was for dashboard history tab, now deleted)
 
 ## Server Structure
 
 ```
 mcp/
-├── index.js                  # Entry point (~25 lines)
-├── server.js                 # MCP stdio server, tool registration (~250 lines)
-├── ws-server.js              # WebSocket listener for extension (~220 lines)
-├── native-host.js            # Native messaging host fallback (~180 lines)
-├── bridge.js                 # Transport abstraction + op routing (~380 lines)
-├── tools.js                  # All 41 tool definitions (~1,400-1,600 lines)
+├── index.js                  # Entry point (14 lines)
+├── server.js                # MCP stdio server, tool registration (60 lines)
+├── ws-server.js              # WebSocket listener for extension + /health endpoint (274 lines)
+├── bridge.js                 # Transport abstraction + op routing (659 lines)
+├── tools.js                  # All 43 tool definitions (1912 lines)
 ├── lib/
-│   ├── security.js           # Ported guards (~180 lines)
-│   ├── tfidf.js              # TF-IDF helpers (~60 lines)
-│   └── proto.js              # Envelope codec, error codes (~90 lines)
+│   ├── security.js           # SSRF guards + AES-256-GCM cookies (133 lines)
+│   ├── tfidf.js              # TF-IDF helpers (55 lines)
+│   └── proto.js              # Envelope codec, error codes (95 lines)
 ├── data/                     # cookies/ bookmarks/ history/ screenshots/
-├── install-native-host.sh    # Native host installer (~80 lines)
-└── package.json              # Drop playwright; keep mcp-sdk, ws, zod
+├── start.sh                  # Server launcher (optional Brave launch)
+├── launch-brave.sh           # Brave + extension launcher (convenience only)
+└── package.json              # mcp-sdk, ws, zod
 ```
 
 ## Communication Protocol
@@ -101,22 +99,25 @@ mcp/
 { "v": 1, "type": "ping", "id": "p01..." }   // → { type:"pong", id:"p01..." }
 ```
 
-### Op Vocabulary (~18 ops, tools compose from these)
+### Op Vocabulary (28 ops, tools compose from these)
 | Op | Executed via |
 |---|---|
 | `browser.state` | `windows.getAll` + `tabs.query` |
 | `tab.list/open/activate/close/info` | `chrome.tabs/windows` |
 | `win.list/activate/close` | `chrome.windows` |
 | `nav.goto` | `tabs.update` (+guards) |
-| `nav.waitReady` | onUpdated + content.js poll + webRequest counter |
-| `cs.eval` | `scripting.executeScript` |
+| `nav.waitReady` | onUpdated + content.js readyState probe |
+| `cs.eval` | `scripting.executeScript` (closure-free fn + JSON args) |
+| `content.exec` | `tabs.sendMessage` → content.js ops (CSP-safe path) |
 | `dbg.cmd` | allowlisted `chrome.debugger` |
 | `input.mouse/key` | dbg Input domain |
 | `net.start/stop/peek` | debugger Network/Fetch engine |
 | `http.request` | `fetch()` in SW with `credentials:"include"` |
 | `cookie.all/set` | `chrome.cookies` |
 | `injected.register/replay/send` | registry + injected.js protocol |
-| `captcha.wait` | content.js MutationObserver |
+| `captcha.wait` | content.js `waitForCaptchaSolved` via `tabs.sendMessage` |
+| `dialog.handle` | CDP `Page.handleJavaScriptDialog` |
+| `download.wait` | `chrome.downloads` polling |
 
 ### Error Codes
 | Code | Meaning |
@@ -135,12 +136,12 @@ mcp/
 | `INTERNAL` | catch-all |
 
 ### Reconnection
-- **Extension**: exponential backoff `min(500·2^n, 15000)ms ± 20% jitter`
-- **Heartbeat**: ping every 10s, 3 missed pongs → force-close & redial
-- **Server**: holds new requests up to 5s during gaps, then rejects
+- **Extension**: exponential backoff `min(500·2^n, 15000)ms ± 20% jitter`; after 5 failed attempts switches to silent 2s `GET /health` probing and dials immediately once the server answers (avoids `ERR_CONNECTION_REFUSED` console spam)
+- **Heartbeat**: ping every 15s, 3 missed pongs → force-close & redial
+- **Server**: hello within 3s (else 4001); link silent 30s → terminate
 - **Session identity**: new `hello` invalidates all pending envelopes
 
-## Tool Migration (41 tools)
+## Tool Migration (43 tools)
 
 ### Phase 1: P0 Skeleton
 - `connect_brave` → WS hello/welcome + browser.state
@@ -198,48 +199,40 @@ mcp/
 | `history_search` | server-recorded store (unchanged) | No |
 
 ### Phase 6: P5 Hardening
-- Native messaging fallback
-- Reconnect chaos-testing
+- Reconnect chaos-testing (done: backoff → 2s health-probe switch, welcome-timeout reschedule)
 - Restricted-page matrix (chrome://, store, PDF viewer, incognito)
 - Port test.cjs assertions to new backend
-- Retire Playwright dependency
 
-## File Size Estimates (actual `wc -l` 2026-08-30)
+## File Size Estimates (actual `wc -l` 2026-09-13)
 
 | File | Actual |
 |---|---|
-| `extension/manifest.json` | 24 |
-| `extension/background.js` | 1978 |
-| `extension/content.js` | 917 |
+| `extension/manifest.json` | 52 |
+| `extension/background.js` | 2283 |
+| `extension/content.js` | 993 |
 | `extension/injected.js` | 820 |
-| `extension/popup.html` | 112 |
-| `extension/popup.js` | 206 |
+| `extension/popup.html` | 115 |
+| `extension/popup.js` | 213 |
 | `extension/dashboard.html` | 209 |
-| `extension/dashboard.js` | 358 |
-| **Extension subtotal** | **~4600** |
+| `extension/dashboard.js` | 434 |
+| **Extension subtotal** | **~5100** |
 | `index.js` (entry) | 14 |
-| `server.js` | 45 |
-| `ws-server.js` | 176 |
-| `bridge.js` | 596 |
-| `tools.js` | 1645 |
-| `lib/security.js` | 82 |
-| `lib/tfidf.js` | 51 |
-| `lib/proto.js` | 92 |
-| **Server subtotal** | **~2700** |
-| **Total** | **~7300** |
+| `server.js` | 60 |
+| `ws-server.js` | 274 |
+| `bridge.js` | 659 |
+| `tools.js` | 1912 |
+| `lib/security.js` | 133 |
+| `lib/tfidf.js` | 55 |
+| `lib/proto.js` | 95 |
+| **Server subtotal** | **~3100** |
+| **Total** | **~8270** |
 
 ## Build & Package
 
 ### Extension (sideload)
 ```bash
-cd extension && zip -r ../browser-navigator-extension-v2.0.0.zip .
+cd extension && zip -r ../browser-navigator-extension-v2.0.9.zip .
 # brave://extensions → Developer mode → "Load unpacked" → select extension/
-```
-
-### Native messaging host (fallback)
-```bash
-./install-native-host.sh
-# Writes manifest to Brave/Chrome/Chromium NativeMessagingHosts dirs
 ```
 
 ### Config
@@ -248,10 +241,9 @@ cd extension && zip -r ../browser-navigator-extension-v2.0.0.zip .
   { "type":"local", "command":["node","/abs/mcp/index.js"], "enabled":true } } }
 ```
 
-### package.json changes
-- Remove: `playwright` (−50 MB)
+### package.json
 - Keep: `@modelcontextprotocol/sdk`, `ws`, `zod`
-- Add scripts: `"serve"`, `"host"`, `"test"`
+- Scripts: `start`, `serve`, `test`, `syntax`
 
 ## Known Risks
 1. **`Page.printToPDF` on headful Brave** — may be unimplemented; fallback to `captureSnapshot` (MHTML)

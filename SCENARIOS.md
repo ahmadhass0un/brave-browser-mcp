@@ -10,7 +10,7 @@
                                    └──────────────────────┘                        └─────────────────────┘
 ```
 
-*Extension is loaded unpacked:* `brave --load-extension=/abs/extension --remote-debugging-port=9222` (9222 only for `launch-brave.sh` convenience, not the control path). Control path is extension `chrome.tabs`/`chrome.scripting`/`chrome.debugger` → WS → `bridge.js` → `tools.js`.
+*Extension is loaded unpacked:* `brave://extensions` → Load unpacked `extension/` (normal launch — `--remote-debugging-port` is NOT needed; the extension uses the in-browser `chrome.debugger` API, and `launch-brave.sh`'s 9222 probe is only a convenience for auto-launch). Control path is extension `chrome.tabs`/`chrome.scripting`/`chrome.debugger` → WS → `bridge.js` → `tools.js`.
 
 ## State Diagram — What Happens on `connect_brave()`
 
@@ -68,7 +68,7 @@ No dual Brave instances. Single user profile is always used (extension runs in D
 │  scroll, screenshot, etc.   │ (bridge) │ on active tab │
 │  tabs / windows             │ ❌       │ ✅ chrome.tabs/windows │
 │  cookies / bookmarks        │ ✅ (server JSON, no browser needed) │ ✅ │
-│  disconnect                 │ ✅       │ ✅ clears currentTabId │
+│  disconnect                 │ ✅       │ ✅ resets transport; extension reconnects on next use │
 └─────────────────────────────┴──────────┴──────────┘
 
   ✅ = Works as expected
@@ -118,6 +118,6 @@ No `Target.createBrowserContext` — `tabs`/`windows` are just `chrome.tabs.crea
 
 1. **Single profile** — extension runs in Default, `chrome.tabs` sees user's real tabs. No isolated `mcp-normal` / `mcp-private` dirs.
 2. **WS is the control path** — `ws://127.0.0.1:9224` (extension → `ws-server.js` → `bridge.js`). `--remote-debugging-port=9222` only for `launch-brave.sh` convenience / `chrome.debugger` attach.
-3. **Waiting is normal** — extension shows `Waiting for MCP server…` (yellow pulse) until `node index.js` is up; then `Connected` green. No `action=new_window` etc.
-4. **No killing** — `disconnect` just clears `currentTabId`; `launch-brave.sh` never kills existing Brave.
+3. **Waiting is normal** — extension shows `Waiting for MCP server…` (yellow pulse) until `node index.js` is up; then `Connected` green. While down it silently probes `http://127.0.0.1:9224/health` every 2s (no console noise) and dials immediately once the server answers. No `action=new_window` etc.
+4. **No killing** — `disconnect` resets the transport (fails in-flight calls, clears currentTabId/refs) and the extension's auto-reconnect makes the next call work again; `launch-brave.sh` never kills existing Brave.
 5. **History/bookmarks are server JSON** — `data/history/history.json` appended by `navigate`, searchable via `history_search`; not `chrome.history` (permission removed).

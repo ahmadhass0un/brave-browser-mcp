@@ -22,14 +22,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 function pageClickCoords(t) {
   let el = null;
-  if (t.selector) el = document.querySelector(t.selector);
-  else if (t.text != null) {
-    const needle = String(t.text).trim().toLowerCase();
-    el = [...document.querySelectorAll(
+  let root = document;
+  if (t.scope) {
+    root = document.querySelector(t.scope);
+    if (!root) return { ok: false, reason: "ELEMENT_NOT_FOUND", message: `scope not found: ${t.scope}` };
+  }
+  if (t.selector) el = root.querySelector(t.selector);
+  else if (t.byText != null || t.text != null) {
+    const needle = String(t.byText ?? t.text).trim().toLowerCase();
+    el = [...root.querySelectorAll(
       "a,button,input[type=submit],input[type=button],summary,label,[role=button],[onclick]",
     )].find((n) => ((n.innerText || n.value || "")).trim().toLowerCase().includes(needle)) ?? null;
   }
-  if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.text };
+  if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.byText ?? t.text };
   el.scrollIntoView({ block: "center", inline: "center" });
   const r = el.getBoundingClientRect();
   return {
@@ -89,18 +94,23 @@ function pageFillActive(value) {
 
 function pageFocus(t) {
   let el = null;
-  if (t.selector) el = document.querySelector(t.selector);
-  else if (t.text != null) {
-    const needle = String(t.text).trim().toLowerCase();
-    el = [...document.querySelectorAll(
+  let root = document;
+  if (t.scope) {
+    root = document.querySelector(t.scope);
+    if (!root) return { ok: false, reason: "ELEMENT_NOT_FOUND", message: `scope not found: ${t.scope}` };
+  }
+  if (t.selector) el = root.querySelector(t.selector);
+  else if (t.byText != null || t.text != null) {
+    const needle = String(t.byText ?? t.text).trim().toLowerCase();
+    el = [...root.querySelectorAll(
       "a,button,input,select,textarea,summary,label,[tabindex],[role=button]",
     )].find((n) => ((n.innerText || n.value || n.placeholder || "")).trim().toLowerCase().includes(needle)) ?? null;
   }
-  if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.text };
+  if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.byText ?? t.text };
   el.focus();
   return {
     ok: document.activeElement === el,
-    focused: t.selector ?? t.text,
+    focused: t.selector ?? t.byText ?? t.text,
     tag: el.tagName.toLowerCase(),
     active: document.activeElement === el,
   };
@@ -166,14 +176,19 @@ function pageScroll(direction, amount, selector) {
 
 function pageHover(t) {
   let el = null;
-  if (t.selector) el = document.querySelector(t.selector);
-  else if (t.text != null) {
-    const needle = String(t.text).trim().toLowerCase();
-    el = [...document.querySelectorAll(
+  let root = document;
+  if (t.scope) {
+    root = document.querySelector(t.scope);
+    if (!root) return { ok: false, reason: "ELEMENT_NOT_FOUND", message: `scope not found: ${t.scope}` };
+  }
+  if (t.selector) el = root.querySelector(t.selector);
+  else if (t.byText != null || t.text != null) {
+    const needle = String(t.byText ?? t.text).trim().toLowerCase();
+    el = [...root.querySelectorAll(
       "a,button,input,select,textarea,summary,label,[role=button],[role=menuitem],[onclick]",
     )].find((n) => ((n.innerText || n.value || n.placeholder || "")).trim().toLowerCase().includes(needle)) ?? null;
   }
-  if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.text };
+  if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.byText ?? t.text };
   el.scrollIntoView({ block: "center", inline: "center" });
   const r = el.getBoundingClientRect();
   const cx = r.left + r.width / 2;
@@ -187,7 +202,7 @@ function pageHover(t) {
   el.dispatchEvent(new MouseEvent("mouseenter", { ...opts, bubbles: false }));
   el.dispatchEvent(new MouseEvent("mousemove", opts));
   return {
-    ok: true, hovered: t.selector ?? t.text, tag: el.tagName.toLowerCase(),
+    ok: true, hovered: t.selector ?? t.byText ?? t.text, tag: el.tagName.toLowerCase(),
     x: Math.round(cx), y: Math.round(cy),
   };
 }
@@ -673,7 +688,7 @@ export function registerTools(server, ctx) {
       return { selector: info.selector };
     }
     if (selector) return { selector: scopeSel(selector, scope) };
-    if (by_text != null) return { text: by_text };
+    if (by_text != null) return { byText: by_text, ...(scope ? { scope } : {}) };
     return null;
   };
 
@@ -696,6 +711,9 @@ export function registerTools(server, ctx) {
     return resolved;
   };
 
+  // Display label for a resolved target (selector / byText / text)
+  const targetLabel = (t) => t?.selector ?? t?.byText ?? t?.text ?? null;
+
   async function performClick(tabId, opts = {}) {
     const {
       selector, byText, ref, scope, button = "left",
@@ -706,12 +724,13 @@ export function registerTools(server, ctx) {
       ? resolveTarget({ selector, by_text: byText, scope, ref })
       : null;
 
-    // CSP-safe fast path: content.js clickElement (ISOLATED, no eval string)
+    // CSP-safe fast path: content.js clickElement (ISOLATED, no eval string).
+    // A successful click returns here regardless of `trusted` — CDP is the
+    // escalation path when content clicks fail (or coordinates are given).
     if (target) {
       try {
         const r = await contentExec(tabId, "clickElement", target);
-        // content click succeeded, still try CDP trusted for isTrusted if requested
-        if (trusted && r && r.clicked !== false) return { ok: true, mode: "content", ...r, target: target.selector ?? target.text ?? null };
+        if (r && r.clicked !== false) return { ok: true, mode: "content", ...r, target: targetLabel(target) };
       } catch {}
     }
 
@@ -720,7 +739,7 @@ export function registerTools(server, ctx) {
       if (!target) throw new Error("click needs selector, by_text, ref, or x/y coordinates");
       try { pt = await evalV(tabId, pageClickCoords, [target]); }
       catch { // fallback to content click already tried, rethrow
-        throw new Error(`click target not found: ${target.selector ?? target.text}`);
+        throw new Error(`click target not found: ${targetLabel(target)}`);
       }
     }
 
@@ -734,7 +753,7 @@ export function registerTools(server, ctx) {
           { type: "mouseReleased", x: pt.x, y: pt.y, button, clickCount, pointerType: "mouse" });
         return {
           ok: true, mode: "cdp-trusted", x: pt.x, y: pt.y, button, clickCount,
-          target: target?.selector ?? target?.text ?? null, tag: pt.tag ?? null, name: pt.name ?? null,
+          target: targetLabel(target), tag: pt.tag ?? null, name: pt.name ?? null,
         };
       } catch (e) {
         if (!target) throw e;
@@ -784,7 +803,8 @@ export function registerTools(server, ctx) {
     }
     const target = resolveTarget({ selector, by_text, scope, ref });
     if (!target) throw new Error("hover needs selector, by_text, ref, or x/y coordinates");
-    return evalV(tabId, pageHover, [target]);
+    try { return await contentExec(tabId, "hoverElement", target); }
+    catch { return evalV(tabId, pageHover, [target]); }
   }
 
   async function performPressKey(tabId, { key, times = 1, selector } = {}) {
@@ -880,7 +900,7 @@ export function registerTools(server, ctx) {
       const state = await bridge.browser.state();
       bridge.drainRecentEvents(); // stale events from a previous session are noise
       if (state?.activeTabId != null) {
-        bridge.setCurrentTab(state.activeTabId, state.windowId ?? null);
+        bridge.setCurrentTab(state.activeTabId, state.activeWindowId ?? null);
       }
       return json({
         connected: true,
@@ -895,7 +915,7 @@ export function registerTools(server, ctx) {
   // 2. disconnect
   server.tool("disconnect", "Disconnect the MCP transport (extension stays connected to browser). Use to reset pending calls, clear refMap, and force next call to re-handshake. No args. Returns ok. Browser tabs remain open.", {},
     guard(async () => {
-      bridge.shutdown();
+      bridge.reset();
       return json({ ok: true, disconnected: true });
     }));
 
@@ -926,7 +946,8 @@ export function registerTools(server, ctx) {
     if (resolvedTabId == null) throw new Error("Not connected. Run connect_brave first.");
     if (background) {
       const opened = await bridge.tabs.open(url, { active: false });
-      addHistoryEntry({ url, title: opened?.title || url, tabId: opened?.tabId ?? null });
+      const openedTab = opened?.tab;
+      addHistoryEntry({ url, title: openedTab?.title || url, tabId: openedTab?.id ?? null });
       return json({ ok: true, openedInBackground: true, ...opened });
     }
     const result = await bridge.nav.goto(url, {
@@ -993,7 +1014,9 @@ export function registerTools(server, ctx) {
   }, guard(async ({ selector, by_text, scope }) => {
     const target = resolveTarget({ selector, by_text, scope });
     if (!target) throw new Error("focus_element needs selector or by_text");
-    return json(await evalV(tab(), pageFocus, [target]));
+    // CSP-safe content.js focusElement first (supports byText + scope), eval fallback
+    try { return json(await contentExec(tab(), "focusElement", target)); }
+    catch { return json(await evalV(tab(), pageFocus, [target])); }
   }));
 
   // 8. press_key
@@ -1260,9 +1283,15 @@ export function registerTools(server, ctx) {
   }, guard(async ({ selector, by_text, scope, max_depth, include_html }) => {
     let target = resolveTarget({ selector, by_text, scope });
     if (!target) throw new Error("inspect_dom needs selector or by_text");
-    if (target.text != null) {
-      const loc = await evalV(tab(), pageLocateByText, [target.text]); // resolve text -> reusable selector
-      target = { selector: loc.selector };
+    if (target.byText != null) {
+      // content.js inspectDom supports byText + scope natively (CSP-safe); fall
+      // back to text→selector resolution via eval when content script is absent
+      try {
+        return json(await contentExec(tab(), "inspectDom", { byText: target.byText, scope: target.scope ?? undefined, max_depth, include_html }));
+      } catch {
+        const loc = await evalV(tab(), pageLocateByText, [target.byText]); // resolve text -> reusable selector
+        target = { selector: loc.selector };
+      }
     }
     return json(await evalV(tab(), pageInspectDeep, [target, max_depth, include_html]));
   }));
@@ -1373,8 +1402,9 @@ export function registerTools(server, ctx) {
       case "open": {
         if (!url) throw new Error('tabs action=open requires "url"');
         result = await bridge.tabs.open(url, { active: !background, windowId: window_id });
-        if (result?.tabId != null && !background) {
-          bridge.setCurrentTab(result.tabId, result.windowId ?? null);
+        const openedTab = result?.tab;
+        if (openedTab?.id != null && !background) {
+          bridge.setCurrentTab(openedTab.id, openedTab.windowId ?? null);
         }
         break;
       }
@@ -1428,7 +1458,7 @@ export function registerTools(server, ctx) {
     }));
 
   // 25. wait_for_captcha
-  server.tool("wait_for_captcha", "Block until human solves CAPTCHA: polls window.__mcpCaptcha + mcp:captcha-solved event in 8s slices. Args: timeout_ms 1s-180s. Returns solved bool, kind, alreadyClear, elapsedMs, or CAPTCHA_WAIT_TIMEOUT. Requires user interaction — notify user to solve.", {
+  server.tool("wait_for_captcha", "Block until human solves CAPTCHA: delegates to content.js waitForCaptchaSolved (visibility checks + mcp:captcha-solved event) in 8s slices. Args: timeout_ms 1s-180s. Returns solved bool, kind, elapsedMs, or CAPTCHA_WAIT_TIMEOUT. Requires user interaction — notify user to solve.", {
     timeout_ms: z.number().int().min(1000).max(180000).default(60000),
   }, guard(async ({ timeout_ms }) => {
     return json(await bridge.captcha.wait({ timeoutMs: timeout_ms }));

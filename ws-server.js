@@ -11,6 +11,7 @@
  */
 
 import { WebSocketServer, WebSocket } from "ws";
+import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { uuid } from "./lib/proto.js";
 import * as bridge from "./bridge.js";
@@ -45,7 +46,24 @@ setInterval(() => {
 
 /** Start the singleton WS server bound to 127.0.0.1. Returns the WebSocketServer. */
 export function start(port = 9224) {
-  const wss = new WebSocketServer({ host: "127.0.0.1", port, maxPayload: 1 << 20 });
+  const httpServer = http.createServer((req, res) => {
+    // Cheap liveness endpoint for the extension's server-down probe:
+    // fetch('http://127.0.0.1:9224/health') → 204 keeps the extension from
+    // hammering the WebSocket (and spamming ERR_CONNECTION_REFUSED) while the
+    // browser is up but the WS link is down.
+    if (req.method === "GET" && (req.url === "/health" || req.url === "/health/")) {
+      res.writeHead(204, { "Content-Length": 0 });
+      res.end();
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("browser-navigator ws-server\n");
+  });
+  const wss = new WebSocketServer({ server: httpServer, maxPayload: 1 << 20 });
+  httpServer.on("error", (e) => log("server error:", e?.message || e));
+  httpServer.listen(port, "127.0.0.1", () => {
+    log(`listening on ws://127.0.0.1:${port} (health: http://127.0.0.1:${port}/health)`);
+  });
   wss.on("connection", (ws, req) => {
     const ip = req.socket.remoteAddress || "unknown";
     const now = Date.now();
@@ -69,8 +87,6 @@ export function start(port = 9224) {
     // supersede the active client (evictActive), so port scans can't disrupt
     // a healthy extension link. Strays die on their own hello timer.
   });
-  wss.on("error", (e) => log("server error:", e?.message || e));
-  log(`listening on ws://127.0.0.1:${port}`);
   return wss;
 }
 
@@ -249,5 +265,10 @@ export function stop(wss) {
   }
   if (wss) {
     try { wss.close(); } catch { /* noop */ }
+    // also close the underlying HTTP server (health endpoint + WS upgrades)
+    const srv = wss._server;
+    if (srv && typeof srv.close === "function") {
+      try { srv.close(); } catch { /* noop */ }
+    }
   }
 }

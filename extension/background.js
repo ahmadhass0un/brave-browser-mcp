@@ -11,7 +11,7 @@
  *   §3  Settings (storage.local)         §11 State tracker (+ upstream events)
  *   §4  Envelope codec                   §12 Injected-script registry
  *   §5  Security guards (SSRF/targets)   §13 Tab-load waiting
- *   §6  WebSocket client                 §14 Operation handlers (25 ops)
+ *   §6  WebSocket client                 §14 Operation handlers (28 ops)
  *   §7  Native-messaging fallback        §15 Wiring & init
  */
 
@@ -49,6 +49,7 @@ try {
 const PROTOCOL_VERSION = 1;
 const EXT_VERSION = "2.0.9";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
+const SERVER_PROBE_INTERVAL_MS = 2_000; // poll for the MCP server while it's down
 
 const HB_INTERVAL_DEFAULT_MS = 15_000; // heartbeat cadence (welcome.hbMs overrides)
 const HB_MAX_MISSED = 3;               // missed pongs before force-close
@@ -61,7 +62,6 @@ const DEFAULT_OP_TIMEOUT_MS = 30_000;
 const MAX_HTTP_BODY_CHARS = 200_000;
 const BODY_PREVIEW_CHARS = 500;
 const OUTBOX_MAX = 512;
-const _evalFnCache = new Map(); // §F.1 cache Function compile 5-15ms per execute_js (cap 100)
 
 const ERR = Object.freeze({
   BAD_REQUEST: "BAD_REQUEST",
@@ -179,8 +179,6 @@ async function loadSettings() {
 function assertSafeWsUrl(raw) {
   const u = new URL(String(raw).trim());
   if (!["ws:", "wss:"].includes(u.protocol)) throw rpcErr(ERR.BAD_REQUEST, `WS scheme must be ws:/wss: got ${u.protocol}`);
-  // warn if non-loopback but allow localhost/127.0.0.1/::1
-  // still block if serverUrl points elsewhere without explicit allow
   return u.href;
 }
 async function setSettings(patch) {
@@ -407,6 +405,7 @@ function winInfo(w) {
 let ws = null;
 let wsReady = false;          // true only between welcome and teardown
 let welcomed = false;
+let everWelcomed = false;     // any successful session this SW lifetime
 let sessionId = null;
 let hbMs = HB_INTERVAL_DEFAULT_MS;
 let missedPongs = 0;
@@ -470,7 +469,9 @@ function stopKeepAlive() {
   if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
 }
 
-/** Exponential backoff: min(500·2^n, 15000) ms ± 20% jitter. */
+/** Exponential backoff: min(500·2^n, 15000) ms ± 20% jitter; while the server
+ *  stays down, switch to silent 2s health-probe polling instead of hammering
+ *  the WebSocket (which logs ERR_CONNECTION_REFUSED per attempt). */
 function scheduleReconnect(opts = {}) {
   if (!chrome.runtime?.id) return;
   if (reconnectTimer) {
@@ -491,6 +492,12 @@ function scheduleReconnect(opts = {}) {
     if (!chrome.runtime?.id) return;
     reconnectTimer = null;
     reconnectAttempts += 1;
+    if (reconnectAttempts >= 5) {
+      // repeated failures ⇒ assume the server is down: probe silently until it's up
+      log(`5 attempts failed — switching to probe mode (${SERVER_PROBE_INTERVAL_MS}ms)`);
+      startProbing();
+      return;
+    }
     connectLoop();
   }, delay);
   log(`reconnecting in ${delay}ms (attempt ${reconnectAttempts + 1})`);
@@ -502,6 +509,64 @@ function setLastError(text) {
   lastErrorText = String(text || "").slice(0, 600);
   clearTimeout(_lastErrTimer);
   if (lastErrorText) _lastErrTimer = setTimeout(() => { lastErrorText = ""; }, 30000);
+}
+
+// ---- Server-down probe ------------------------------------------------------
+// While the MCP server is down, a raw new WebSocket() makes Chrome emit an
+// uncatchable "ERR_CONNECTION_REFUSED" console line per retry. Instead we poll
+// the server's HTTP health endpoint with fetch (whose failures we suppress)
+// and only open the WebSocket once the server is actually up.
+
+let probeTimer = null;
+let probing = false;
+
+/** WS url -> http(s) health url (ws://127.0.0.1:9224 → http://127.0.0.1:9224/health). */
+function probeUrlOf(wsUrl) {
+  try {
+    const u = new URL(wsUrl);
+    u.protocol = u.protocol === "wss:" ? "https:" : "http:";
+    u.pathname = "/health";
+    u.search = "";
+    u.hash = "";
+    return u.href;
+  } catch { return null; }
+}
+
+/** True when the MCP server answers its health endpoint. Any HTTP response
+ *  counts (even 404/426 from an older server build without /health) — we only
+ *  need to know that something is listening before dialing the WebSocket. */
+async function serverUp(wsUrl) {
+  const url = probeUrlOf(wsUrl);
+  if (!url) return true; // unreachable URL — let openSocket fail normally
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 1_800); // < probe interval: no stacking
+  try {
+    await fetch(url, { method: "GET", cache: "no-store", signal: ctl.signal });
+    return true;
+  } catch { return false; }
+  finally { clearTimeout(timer); }
+}
+
+function startProbing() {
+  if (probeTimer) return;
+  probing = true;
+  probeTimer = setInterval(async () => {
+    if (!chrome.runtime?.id) { stopProbing(); return; }
+    if (isOpen(ws) || connectInFlight) return;
+    const url = settingsCache.serverUrl || DEFAULT_SERVER_URL;
+    if (await serverUp(url)) {
+      log("server probe: up — dialing");
+      stopProbing();
+      reconnectAttempts = 0;
+      connectLoop();
+    }
+  }, SERVER_PROBE_INTERVAL_MS);
+  probeTimer.unref?.();
+}
+
+function stopProbing() {
+  probing = false;
+  if (probeTimer) { clearInterval(probeTimer); probeTimer = null; }
 }
 
 function teardownSocket(reason) {
@@ -527,10 +592,18 @@ function teardownSocket(reason) {
 async function connectLoop() {
   if (!chrome.runtime?.id) return; // extension reloaded / context invalidated
   if (connectInFlight || isOpen(ws)) return;
+  stopProbing(); // a direct dial supersedes probe mode
   connectInFlight = true;
   try {
     await loadSettings();
     const url = (typeof settingsCache.serverUrl === 'string' && settingsCache.serverUrl) ? settingsCache.serverUrl : DEFAULT_SERVER_URL;
+    // Cold start: probe the health endpoint first so a down server never
+    // triggers Chrome's uncatchable ERR_CONNECTION_REFUSED WebSocket log.
+    if (!everWelcomed && !(await serverUp(url))) {
+      log("server down at boot — entering probe mode");
+      startProbing();
+      return;
+    }
     log(`connecting → ${url}`);
     const okOpen = await openSocket(url);
     if (!okOpen) log("connection attempt failed");
@@ -560,7 +633,12 @@ function openSocket(url) {
       missedPongs = 0;
       try { sock.send(JSON.stringify(helloFrame())); } catch { /* retry via close */ }
       clearTimeout(welcomeTimer);
-      welcomeTimer = setTimeout(() => teardownSocket("welcome-timeout"), WELCOME_TIMEOUT_MS);
+      welcomeTimer = setTimeout(() => {
+        // Must reschedule: teardownSocket nulls sock.onclose, so no other path
+        // would retry (stall forever after a slow server handshake).
+        teardownSocket("welcome-timeout");
+        scheduleReconnect();
+      }, WELCOME_TIMEOUT_MS);
       resolve(true);
     };
     sock.onmessage = (ev) => {
@@ -616,6 +694,7 @@ function routeEnvelope(env) {
       welcomeTimer = null;
       welcomed = true;
       wsReady = true;
+      everWelcomed = true;
       sessionId = typeof env.sessionId === "string" && env.sessionId ? env.sessionId : uid("s");
       hbMs = clampNum(env.hbMs, 1000, 60_000, HB_INTERVAL_DEFAULT_MS);
       reconnectAttempts = 0;
@@ -1284,37 +1363,9 @@ function __mcpSendInjected(name, payload, nonce, timeoutMs) {
   });
 }
 
-/** One poll-slice of the captcha wait. Requires the content.js observer
- *  contract: `window.__mcpCaptcha = { solved:boolean, kind:string|null }`
- *  plus a `mcp:captcha-solved` CustomEvent on completion. */
-function __mcpWaitCaptchaChunk(sliceMs) {
-  return new Promise((resolve) => {
-    const snap = () =>
-      (window.__mcpCaptcha && typeof window.__mcpCaptcha === "object")
-        ? { solved: !!window.__mcpCaptcha.solved, kind: window.__mcpCaptcha.kind ?? null }
-        : null;
-    const s0 = snap();
-    if (s0 && s0.solved) { resolve({ solved: true, kind: s0.kind, alreadyClear: true }); return; }
-    const EV = "mcp:captcha-solved";
-    const deadline = Date.now() + sliceMs;
-    let done = false;
-    let iv = null;
-    const finish = (outcome) => {
-      if (done) return;
-      done = true;
-      window.removeEventListener(EV, onSolved, true);
-      if (iv) clearInterval(iv);
-      resolve(outcome);
-    };
-    const onSolved = (ev) => finish({ solved: true, kind: (ev && ev.detail && ev.detail.kind) ?? null });
-    window.addEventListener(EV, onSolved, true);
-    iv = setInterval(() => {
-      const s = snap();
-      if (s && s.solved) finish({ solved: true, kind: s.kind });
-      else if (Date.now() >= deadline) finish({ sliced: true });
-    }, 350);
-  });
-}
+/** One poll-slice of the captcha wait. (Removed: superseded by content.exec
+ *  "waitForCaptchaSolved" — chrome.scripting worlds are isolated from the
+ *  content script, so the old __mcpCaptcha contract was never observable.) */
 
 // ============================================================================
 // §13 Tab-load waiting
@@ -1593,17 +1644,15 @@ async function hCsEval(args) {
   const callArgs = JSON.stringify(Array.isArray(args.args) ? args.args : []);
   const allFrames = !!(args && args.allFrames);
 
+  // Closure-free by contract: this function is serialized into the page by
+  // chrome.scripting.executeScript, so it MUST NOT reference module scope.
   const evalFn = (src, argsJson) => {
     const argv = JSON.parse(argsJson);
-    let fn = _evalFnCache.get(src);
-    if (!fn) {
-      try { fn = new Function('return (' + src + ')')(); } catch { fn = undefined; }
-      if (typeof fn !== 'function') {
-        try { fn = new Function('return (function (...a) { ' + src + ' })')(); }
-        catch (e) { return { __mcpError: String(e).slice(0, 300) }; }
-      }
-      if (_evalFnCache.size > 100) { const k = _evalFnCache.keys().next().value; _evalFnCache.delete(k); }
-      _evalFnCache.set(src, fn);
+    let fn;
+    try { fn = new Function('return (' + src + ')')(); } catch { fn = undefined; }
+    if (typeof fn !== 'function') {
+      try { fn = new Function('return (function (...a) { ' + src + ' })')(); }
+      catch (e) { return { __mcpError: String(e).slice(0, 300) }; }
     }
     try {
       const r = fn.apply(null, argv);
@@ -2090,27 +2139,28 @@ async function hCaptchaWait(args) {
   const timeoutMs = optNum(args, "timeoutMs", 60_000, 1000, 180_000);
   const startedAt = nowTs();
   const deadline = startedAt + timeoutMs;
-  // Chunked slices keep each executeScript bounded; the outer loop spans the
-  // full budget. Delegates detection to content.js's MutationObserver contract.
+  // Delegate to content.js waitForCaptchaSolved via tabs.sendMessage — the
+  // content script owns the visibility checks + mcp:captcha-solved event.
+  // Slice the budget so no single sendMessage can outlive the RPC deadline.
   for (;;) {
     const remaining = deadline - nowTs();
     if (remaining <= 0) break;
     const slice = Math.min(8000, remaining);
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "ISOLATED", // shares the world with content.js
-      func: __mcpWaitCaptchaChunk,
-      args: [slice],
-    }).catch((e) => { throw mapChromeError(e); });
-    const r = results && results[0];
-    if (r && r.error) throw rpcErr(ERR.EVAL_FAILED, String(r.error).slice(0, 300));
-    const res = r ? r.result : undefined;
+    let res;
+    try {
+      const resp = await chrome.tabs.sendMessage(tabId, { op: "waitForCaptchaSolved", args: { timeoutMs: slice } });
+      if (resp && resp.ok) res = resp.result;
+      else throw rpcErr(ERR.EVAL_FAILED, String(resp?.error?.message || resp?.error || "content op failed").slice(0, 300));
+    } catch (e) {
+      if (e instanceof RpcError) throw e;
+      throw mapChromeError(e);
+    }
     if (res && res.solved) {
-      return ok({ solved: true, kind: res.kind ?? null, alreadyClear: !!res.alreadyClear, elapsedMs: nowTs() - startedAt });
+      return ok({ solved: true, kind: res.kind ?? null, elapsedMs: nowTs() - startedAt });
     }
   }
   throw rpcErr(ERR.CAPTCHA_WAIT_TIMEOUT,
-    `No captcha resolution within ${timeoutMs}ms (needs content.js observer: window.__mcpCaptcha / "mcp:captcha-solved")`);
+    `No captcha resolution within ${timeoutMs}ms (content.js waitForCaptchaSolved timed out)`);
 }
 
 // ============================================================================

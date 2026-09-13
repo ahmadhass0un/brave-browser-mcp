@@ -50,10 +50,6 @@ const DBG_METHOD_TIMEOUT_MS = {
 
 function resolveTimeoutMs(op, args, opts) {
   if (Number.isFinite(opts?.timeoutMs) && opts.timeoutMs > 0) return Math.min(300_000, Math.floor(opts.timeoutMs));
-  if (op === "wait_for") { // inner budget + slack for the final poll slice
-    const inner = Number.isFinite(args?.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : TIMEOUTS.DEFAULT;
-    return Math.min(300_000, Math.floor(inner) + 5_000);
-  }
   const base = OP_TIMEOUT_MS[op]
     || (op === "dbg.cmd" ? DBG_METHOD_TIMEOUT_MS[args?.method] : undefined)
     || TIMEOUTS.DEFAULT;
@@ -112,7 +108,7 @@ export function setWs(ws) {
 
 let shuttingDown = false;
 
-/** Close every transport and fail anything still in flight. */
+/** Close every transport and fail anything still in flight. Terminal (SIGINT/SIGTERM). */
 export function shutdown() {
   shuttingDown = true;
   const err = new RpcError(ERROR_CODES.NOT_CONNECTED, "Bridge shut down", false);
@@ -124,6 +120,24 @@ export function shutdown() {
   const sock = wsTransport;
   wsTransport = null;
   if (sock) { try { sock.close(1001, "server-shutdown"); } catch { /* gone */ } }
+  clearRefs();
+  recentEvents.length = 0;
+}
+
+/** Reversible disconnect (the `disconnect` MCP tool): drop the transport and
+ *  pending calls, but let the next extension handshake re-wire via setWs().
+ *  The extension's auto-reconnect will re-handshake and recover. */
+export function reset() {
+  const sock = wsTransport;
+  wsTransport = null;
+  const err = new RpcError(ERROR_CODES.TRANSPORT_LOST, "Disconnected by request", true);
+  for (const [id, entry] of pending) {
+    clearTimeout(entry.timer);
+    pending.delete(id);
+    entry.reject(err);
+  }
+  if (sock) { try { sock.close(1000, "client-disconnect"); } catch { /* gone */ } }
+  setCurrentTab(null);
   clearRefs();
   recentEvents.length = 0;
 }
@@ -396,22 +410,27 @@ const targetOf = (target) => {
 
 function pageClick(t) {
   let el = null;
-  if (t.selector) el = document.querySelector(t.selector);
-  else if (t.text != null) {
-    const needle = String(t.text).trim().toLowerCase();
-    el = [...document.querySelectorAll(
+  let root = document;
+  if (t.scope) {
+    root = document.querySelector(t.scope);
+    if (!root) return { ok: false, reason: "ELEMENT_NOT_FOUND", message: `scope not found: ${t.scope}` };
+  }
+  if (t.selector) el = root.querySelector(t.selector);
+  else if (t.byText != null || t.text != null) {
+    const needle = String(t.byText ?? t.text).trim().toLowerCase();
+    el = [...root.querySelectorAll(
       "a,button,input[type=submit],input[type=button],summary,label,[role=button],[onclick]",
     )].find((n) => ((n.innerText || n.value || "")).trim().toLowerCase().includes(needle)) ?? null;
   }
-  if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.text };
+  if (!el) return { ok: false, reason: "ELEMENT_NOT_FOUND", target: t.selector ?? t.byText ?? t.text };
   el.scrollIntoView({ block: "center", inline: "center" });
   const r = el.getBoundingClientRect();
   const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
   if (hit && hit !== el && !el.contains(hit)) {
-    return { ok: false, reason: "CLICK_BLOCKED", target: t.selector ?? t.text, coveredBy: hit.tagName.toLowerCase() };
+    return { ok: false, reason: "CLICK_BLOCKED", target: t.selector ?? t.byText ?? t.text, coveredBy: hit.tagName.toLowerCase() };
   }
   el.click();
-  return { ok: true, clicked: t.selector ?? t.text, tag: el.tagName.toLowerCase() };
+  return { ok: true, clicked: t.selector ?? t.byText ?? t.text, tag: el.tagName.toLowerCase() };
 }
 
 function pageFill(t, value) {
@@ -633,6 +652,8 @@ export const dom = {
   waitFor: async (tabId, target, opts = {}) => {
     const budgetMs = Math.max(1_000, Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 15_000);
     const normalized = typeof target === "string" ? { selector: target } : target;
-    return unwrap(dom.eval(tabId, pageWaitFor, [normalized, budgetMs], opts), ERROR_CODES.TIMEOUT);
+    // outer RPC budget = inner page budget + 5s slack, so the page-side
+    // {ok:false,reason:TIMEOUT} result wins the race over the RPC timeout
+    return unwrap(dom.eval(tabId, pageWaitFor, [normalized, budgetMs], { ...opts, timeoutMs: budgetMs + 5_000 }), ERROR_CODES.TIMEOUT);
   },
 };

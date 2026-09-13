@@ -304,6 +304,7 @@
       let settled = false;
       let pollTimer = 0;
       let timeoutTimer = 0;
+      const initial = detectCaptcha();
       const finish = (solved) => {
         if (settled) return;
         settled = true;
@@ -311,7 +312,7 @@
         clearTimeout(timeoutTimer);
         window.removeEventListener(CAPTCHA_SOLVED_EVENT, onFinish);
         document.removeEventListener(CAPTCHA_SOLVED_EVENT, onFinish);
-        resolve({ solved });
+        resolve({ solved, kind: solved ? initial.type : null });
       };
       const captchaGone = () => {
         const vis = makeVisibilityChecker();

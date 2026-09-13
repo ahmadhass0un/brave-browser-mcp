@@ -79,7 +79,7 @@ function renderBrowserInfo(){
   else if(/OPR\//.test(ua)) name='Opera';
   else if(navigator.brave && navigator.brave.isBrave) name='Brave';
   else if(/Chrome\//.test(ua)) name='Chrome';
-  const ver=(ua.match(/(?:Chrome|Edg|OPR)\/([\\d.]+)/)||[])[1]||'unknown';
+  const ver=(ua.match(/(?:Chrome|Edg|OPR)\/([\d.]+)/)||[])[1]||'unknown';
   const rows=[
     ['Browser', `${name} ${ver.split('.')[0]}`],
     ['Extension', `v${chrome.runtime.getManifest().version}`],

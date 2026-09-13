@@ -54,8 +54,29 @@ async function refreshStatus(){
 async function renderOverviewCur(){
   try{
     const [tab]=await chrome.tabs.query({active:true, currentWindow:true});
-    if(!tab) return $('ov-cur').textContent='No active tab';
-    $('ov-cur').innerHTML = `<div style="display:flex;gap:10px;align-items:center"><img src="${tab.favIconUrl||''}" style="width:20px;height:20px;border-radius:4px;background:var(--border)" onerror="this.style.display='none'"><div style="min-width:0"><div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${tab.title||'—'}</div><div style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${tab.url}</div></div><span class="badge">${tab.status||''}</span></div>`;
+    const host=$('ov-cur');
+    if(!tab){ host.textContent='No active tab'; return; }
+    host.textContent='';
+    const wrap=document.createElement('div');
+    wrap.style.cssText='display:flex;gap:10px;align-items:center';
+    const img=document.createElement('img');
+    img.src=tab.favIconUrl||'';
+    img.style.cssText='width:20px;height:20px;border-radius:4px;background:var(--border);flex:none';
+    img.onerror=()=> img.style.display='none';
+    const mid=document.createElement('div');
+    mid.style.cssText='min-width:0';
+    const title=document.createElement('div');
+    title.style.cssText='font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+    title.textContent=tab.title||'—';
+    const url=document.createElement('div');
+    url.style.cssText='font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+    url.textContent=tab.url||'';
+    mid.append(title,url);
+    const badge=document.createElement('span');
+    badge.className='badge';
+    badge.textContent=tab.status||'';
+    wrap.append(img,mid,badge);
+    host.appendChild(wrap);
   }catch{}
 }
 function renderBrowserInfo(){
@@ -80,15 +101,44 @@ async function refreshBrowser(){
     if(filter) filtered = tabs.filter(t=> (t.title||'').toLowerCase().includes(filter) || (t.url||'').toLowerCase().includes(filter));
     const list=$('browser-tabs');
     if(!filtered.length) list.innerHTML='<div class="notice">No tabs match filter</div>';
-    else list.innerHTML = filtered.map(t=>`
-      <div class="tab-row ${t.active?'active':''}" data-tab="${t.id}">
-        <img src="${t.favIconUrl||''}" onerror="this.style.display='none'">
-        <div class="t"><div class="title">${escapeHtml(t.title||'Untitled')}</div><div class="url">${escapeHtml(t.url||'')}</div></div>
-        <button class="btn btn-sm" data-act="switch" data-id="${t.id}">Switch</button>
-        <button class="btn btn-sm" data-act="close" data-id="${t.id}">Close</button>
-      </div>`).join('');
+    else {
+      list.textContent='';
+      for(const t of filtered){
+        const row=document.createElement('div');
+        row.className='tab-row'+(t.active?' active':'');
+        row.dataset.tab=String(t.id);
+        const img=document.createElement('img');
+        img.src=t.favIconUrl||'';
+        img.onerror=()=> img.style.display='none';
+        const box=document.createElement('div');
+        box.className='t';
+        const title=document.createElement('div');
+        title.className='title';
+        title.textContent=t.title||'Untitled';
+        const url=document.createElement('div');
+        url.className='url';
+        url.textContent=t.url||'';
+        box.append(title,url);
+        const btnSwitch=document.createElement('button');
+        btnSwitch.className='btn btn-sm';
+        btnSwitch.dataset.act='switch'; btnSwitch.dataset.id=String(t.id);
+        btnSwitch.textContent='Switch';
+        const btnClose=document.createElement('button');
+        btnClose.className='btn btn-sm';
+        btnClose.dataset.act='close'; btnClose.dataset.id=String(t.id);
+        btnClose.textContent='Close';
+        row.append(img,box,btnSwitch,btnClose);
+        list.appendChild(row);
+      }
+    }
     list.querySelectorAll('button[data-act="switch"]').forEach(b=> b.onclick=e=>{
-      e.stopPropagation(); chrome.tabs.update(parseInt(b.dataset.id),{active:true}).then(()=> chrome.windows.update(tabs.find(x=>x.id==parseInt(b.dataset.id))?.windowId,{focused:true})).then(refreshBrowser);
+      e.stopPropagation();
+      const id=parseInt(b.dataset.id);
+      const t=tabs.find(x=>x.id===id);
+      const focusWin = t && t.windowId!=null
+        ? chrome.windows.update(t.windowId,{focused:true})
+        : Promise.resolve();
+      chrome.tabs.update(id,{active:true}).then(()=>focusWin).then(refreshBrowser);
     });
     list.querySelectorAll('button[data-act="close"]').forEach(b=> b.onclick=e=>{
       e.stopPropagation(); chrome.tabs.remove(parseInt(b.dataset.id)).then(refreshBrowser);
@@ -97,7 +147,28 @@ async function refreshBrowser(){
       row.onclick=()=> chrome.tabs.update(parseInt(row.dataset.tab),{active:true}).then(refreshBrowser);
     });
     const winsEl=$('browser-wins');
-    winsEl.innerHTML = wins.map(w=> `<div style="padding:6px 0;border-bottom:1px solid var(--border)"><strong>Window ${w.id}</strong> ${w.focused?'<span class=badge>focused</span>':''} — ${w.tabs.length} tabs — ${w.width}×${w.height} <button class="btn btn-sm" data-win="${w.id}">Focus</button></div>`).join('');
+    winsEl.textContent='';
+    for(const w of wins){
+      const div=document.createElement('div');
+      div.style.cssText='padding:6px 0;border-bottom:1px solid var(--border)';
+      const strong=document.createElement('strong');
+      strong.textContent=`Window ${w.id}`;
+      div.appendChild(strong);
+      if(w.focused){
+        div.appendChild(document.createTextNode(' '));
+        const badge=document.createElement('span');
+        badge.className='badge';
+        badge.textContent='focused';
+        div.appendChild(badge);
+      }
+      div.appendChild(document.createTextNode(` — ${w.tabs.length} tabs — ${w.width}×${w.height} `));
+      const btn=document.createElement('button');
+      btn.className='btn btn-sm';
+      btn.dataset.win=String(w.id);
+      btn.textContent='Focus';
+      div.appendChild(btn);
+      winsEl.appendChild(div);
+    }
     winsEl.querySelectorAll('button[data-win]').forEach(b=> b.onclick=()=> chrome.windows.update(parseInt(b.dataset.win),{focused:true}));
   }catch(e){
     $('browser-tabs').innerHTML=`<div class="notice">Error: ${escapeHtml(String(e))}</div>`;
@@ -118,7 +189,7 @@ async function refreshToolTabs(){
   const sel=$('tool-tab');
   if(!sel) return;
   const tabs=await chrome.tabs.query({});
-  sel.innerHTML='<option value="">(active tab)</option>'+tabs.map(t=> `<option value="${t.id}">${t.id}: ${(t.title||t.url).slice(0,40)}</option>`).join('');
+  buildTabOptions(sel, tabs, '');
 }
 refreshToolTabs();
 $('tool-run')?.addEventListener('click', async()=>{
@@ -284,7 +355,7 @@ async function refreshQATabs(){
   const tabs=await chrome.tabs.query({});
   const browsable=tabs.filter(t=> t.url && /^https?:/.test(t.url));
   if(!browsable.length){ sel.innerHTML='<option value="">(no browsable tabs — open an HTTP page)</option>'; return; }
-  sel.innerHTML=browsable.map(t=> `<option value="${t.id}">${t.id}: ${(t.title||t.url).slice(0,45)}</option>`).join('');
+  buildTabOptions(sel, browsable);
 }
 function qaTabId(){
   const sel=$('qa-tab');
@@ -336,6 +407,20 @@ $('ov-newtab').onclick=()=> chrome.tabs.create({url:'chrome://newtab/'});
 
 // utils
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function buildTabOptions(sel, tabs, emptyLabel){
+  sel.textContent='';
+  if(emptyLabel !== undefined){
+    const o=document.createElement('option');
+    o.value=''; o.textContent=emptyLabel;
+    sel.appendChild(o);
+  }
+  for(const t of tabs){
+    const o=document.createElement('option');
+    o.value=String(t.id);
+    o.textContent=`${t.id}: ${String(t.title||t.url||'').slice(0,45)}`;
+    sel.appendChild(o);
+  }
+}
 
 // init
 refreshStatus(); renderOverviewCur(); renderBrowserInfo(); refreshBrowser(); refreshQATabs();

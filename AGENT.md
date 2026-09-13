@@ -8,6 +8,30 @@ LLM → MCP Server (server.js / bridge.js) --stdio--> ws://127.0.0.1:9224 --WS--
 
 Single user profile. No Playwright. No separate `--user-data-dir`.
 
+## Install (for the LLM / agent setting this up)
+
+```bash
+git clone https://github.com/ahmadhass0un/brave-browser-mcp.git
+cd brave-browser-mcp
+npm install            # deps: @modelcontextprotocol/sdk, ws, zod
+```
+
+1. **Load the extension** — `brave://extensions` → Developer mode → Load unpacked → `extension/`. No `--remote-debugging-port` needed (normal browser launch is fine).
+2. **Start the server** — `node index.js` (stdio MCP + `ws://127.0.0.1:9224`; extension shows "Waiting…" until up, then "Connected").
+3. **Register as MCP server** — opencode `opencode.json`:
+```json
+{ "mcp": { "browser-navigator": {
+  "type": "local",
+  "command": ["node", "/absolute/path/to/brave-browser-mcp/index.js"],
+  "enabled": true } } }
+```
+Claude Desktop `claude_desktop_config.json`:
+```json
+{ "mcpServers": { "browser-navigator": {
+  "command": "node",
+  "args": ["/absolute/path/to/brave-browser-mcp/index.js"] } } }
+```
+
 ## Key Files
 
 | File | Purpose |
@@ -15,12 +39,12 @@ Single user profile. No Playwright. No separate `--user-data-dir`.
 | `index.js` | Entry, creates data dirs, handles SIGINT, calls server.main() |
 | `server.js` | McpServer stdio + ws-server:9224 |
 | `bridge.js` | Transport abstraction (call, pending, tabs/windows/nav/dbg/dom facades) |
-| `tools.js` | 41 MCP tools |
+| `tools.js` | 43 MCP tools |
 | `ws-server.js` | WS listener 127.0.0.1:9224, handshake hello→welcome |
-| `extension/background.js` | MV3 service worker, 25 ops (§14) |
+| `extension/background.js` | MV3 service worker, 28 ops (§14) |
 | `extension/content.js` | DOM ops (listInteractive, inspectDom, click, etc.) |
 | `extension/injected.js` | MAIN-world persistent runtime |
-| `extension/manifest.json` | MV3, permissions tabs/windows/scripting/debugger/cookies |
+| `extension/manifest.json` | MV3, permissions tabs/windows/scripting/debugger/cookies/storage/downloads |
 
 ## Requirements
 
@@ -34,7 +58,7 @@ Single user profile. No Playwright. No separate `--user-data-dir`.
 
 ## Adding a Tool
 
-In `tools.js:551 registerTools()`:
+In `tools.js:624 registerTools()`:
 ```js
 server.tool("name", "desc", { param: z.string() }, guard(async ({param}) => json({ok:true})));
 ```
