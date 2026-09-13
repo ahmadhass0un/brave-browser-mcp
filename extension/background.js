@@ -47,7 +47,7 @@ try {
 // ============================================================================
 
 const PROTOCOL_VERSION = 1;
-const EXT_VERSION = "2.0.12";
+const EXT_VERSION = "2.0.13";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
 const SERVER_PROBE_INTERVAL_MS = 2_000; // poll for the MCP server while it's down
 
@@ -1688,7 +1688,19 @@ async function hJsEvaluate(args) {
   if (!code || !code.trim()) throw rpcErr(ERR.BAD_REQUEST, "code is required");
   if (code.length > 20000) throw rpcErr(ERR.BAD_REQUEST, "code too long");
   await getTabOrThrow(tabId);
-  const expr = code.trim();
+  // Auto-wrap bare "return expr" / expression bodies in an async IIFE so
+  // Runtime.evaluate accepts both statement-style and expression-style input.
+  const raw = code.trim();
+  let expr;
+  if (/^return\s/m.test(raw)) {
+    expr = `(async () => { ${raw} })()`;
+  } else if (/^(async\s+function\b|function\b|async\s*\(|\(|[A-Za-z_$][\w$]*\s*=>)/.test(raw)) {
+    // already a function source — call it
+    expr = `(${raw})()`;
+  } else {
+    // plain expression: yield its value
+    expr = `(async () => (${raw}))()`;
+  }
   // Use debugger Runtime.evaluate (bypasses both page CSP and extension_pages CSP)
   return withDebugger(tabId, async (tid) => {
     const res = await cdpSend(tid, "Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true });

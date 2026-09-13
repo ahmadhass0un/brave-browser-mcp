@@ -1,6 +1,6 @@
 /**
  * browser-navigator — tools.js
- * Registers all 43 MCP tools on an McpServer instance. v2.0.12 CSP-safe.
+ * Registers all 43 MCP tools on an McpServer instance. v2.0.13 CSP-safe.
  */
 
 import { z } from "zod";
@@ -720,13 +720,28 @@ export function registerTools(server, ctx) {
       clickCount = 1, trusted = true, x, y,
     } = opts;
 
-    const target = (x == null || y == null)
+    const hasCoords = x != null && y != null;
+    const target = !hasCoords
       ? resolveTarget({ selector, by_text: byText, scope, ref })
       : null;
 
-    // CSP-safe fast path: content.js clickElement (ISOLATED, no eval string).
-    // A successful click returns here regardless of `trusted` — CDP is the
-    // escalation path when content clicks fail (or coordinates are given).
+    // Coords path: go straight to trusted CDP input (games, canvas, coordinate clicks)
+    if (hasCoords) {
+      if (trusted) {
+        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
+          { type: "mouseMoved", x, y, button: "none", clickCount: 0, pointerType: "mouse" }, { timeoutMs: 8000 });
+        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
+          { type: "mousePressed", x, y, button, clickCount, pointerType: "mouse" });
+        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
+          { type: "mouseReleased", x, y, button, clickCount, pointerType: "mouse" });
+        return { ok: true, mode: "cdp-trusted", x, y, button, clickCount };
+      }
+      return { ok: true, mode: "coords-only", x, y };
+    }
+
+    if (!target) throw new Error("click needs selector, by_text, ref, or x/y coordinates");
+
+    // CSP-safe fast path: content.js clickElement (ISOLATED, no eval string)
     if (target) {
       try {
         const r = await contentExec(tabId, "clickElement", target);
@@ -734,13 +749,16 @@ export function registerTools(server, ctx) {
       } catch {}
     }
 
-    let pt = (x != null && y != null) ? { ok: true, x, y } : null;
+    // Resolve element center coords — content.js measureRect first (CSP-safe), eval fallback
+    let pt = null;
+    try {
+      const t = target.selector ? { selector: target.selector } : { byText: target.byText };
+      const rect = await contentExec(tabId, "measureRect", t);
+      if (rect && rect.width > 0) pt = { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2), tag: null, name: null };
+    } catch {}
     if (!pt) {
-      if (!target) throw new Error("click needs selector, by_text, ref, or x/y coordinates");
       try { pt = await evalV(tabId, pageClickCoords, [target]); }
-      catch { // fallback to content click already tried, rethrow
-        throw new Error(`click target not found: ${targetLabel(target)}`);
-      }
+      catch { throw new Error(`click target not found: ${targetLabel(target)}`); }
     }
 
     if (trusted) {
@@ -756,13 +774,56 @@ export function registerTools(server, ctx) {
           target: targetLabel(target), tag: pt.tag ?? null, name: pt.name ?? null,
         };
       } catch (e) {
-        if (!target) throw e;
         const fb = await bridge.dom.clickElement(tabId, target);
         return { ...fb, mode: "dom-fallback", trustedError: e?.message || String(e) };
       }
     }
-    if (!target) return { ok: true, mode: "coords-only", x: pt.x, y: pt.y };
     return bridge.dom.clickElement(tabId, target);
+  }
+
+  /** Trusted keyboard via CDP Input.dispatchKeyEvent — required for canvas games,
+   *  cross-origin iframes (Poki), and sites rejecting synthetic events. */
+  async function performTrustedKey(tabId, key, times = 1) {
+    const SPECIAL = {
+      enter: ["Enter", "Enter", 13], tab: ["Tab", "Tab", 9],
+      escape: ["Escape", "Escape", 27], backspace: ["Backspace", "Backspace", 8],
+      delete: ["Delete", "Delete", 46],
+      arrowup: ["ArrowUp", "ArrowUp", 38], arrowdown: ["ArrowDown", "ArrowDown", 40],
+      arrowleft: ["ArrowLeft", "ArrowLeft", 37], arrowright: ["ArrowRight", "ArrowRight", 39],
+      up: ["ArrowUp", "ArrowUp", 38], down: ["ArrowDown", "ArrowDown", 40],
+      left: ["ArrowLeft", "ArrowLeft", 37], right: ["ArrowRight", "ArrowRight", 39],
+      space: [" ", "Space", 32],
+    };
+    const parts = String(key).split("+").map((p) => p.trim()).filter(Boolean);
+    const keyName = parts.pop() ?? "";
+    const mods = parts.reduce((m, p) => {
+      const l = p.toLowerCase();
+      if (l === "shift") m.shift = 1;
+      else if (l === "ctrl" || l === "control") m.ctrl = 1;
+      else if (l === "alt" || l === "option") m.alt = 1;
+      else if (l === "meta" || l === "cmd" || l === "command") m.meta = 1;
+      return m;
+    }, {});
+    const lower = keyName.toLowerCase();
+    let k, code, vk;
+    if (SPECIAL[lower]) [k, code, vk] = SPECIAL[lower];
+    else if (keyName.length === 1) {
+      k = keyName;
+      code = /^[a-z]$/i.test(keyName) ? "Key" + keyName.toUpperCase() : /^[0-9]$/.test(keyName) ? "Digit" + keyName : "Unidentified";
+      vk = keyName.toUpperCase().charCodeAt(0) || 0;
+      if (/[A-Z]/.test(keyName)) mods.shift = 1;
+    } else { k = keyName; code = "Unidentified"; vk = 0; }
+    for (let i = 0; i < times; i++) {
+      await bridge.dbg.command(tabId, "Input.dispatchKeyEvent",
+        { type: "keyDown", key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: (mods.ctrl||0)|(mods.shift||0)|(mods.alt||0)|(mods.meta||0) });
+      if (k.length === 1) {
+        await bridge.dbg.command(tabId, "Input.dispatchKeyEvent",
+          { type: "char", key: k, code, text: k, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: (mods.ctrl||0)|(mods.shift||0)|(mods.alt||0)|(mods.meta||0) });
+      }
+      await bridge.dbg.command(tabId, "Input.dispatchKeyEvent",
+        { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: (mods.ctrl||0)|(mods.shift||0)|(mods.alt||0)|(mods.meta||0) });
+    }
+    return { pressed: times, key, mode: "cdp-trusted" };
   }
 
   async function performType(tabId, { selector, text, delay = 0, delayPerChar = 0, scope, ref } = {}) {
@@ -989,19 +1050,21 @@ export function registerTools(server, ctx) {
     return json(result);
   }));
 
-  // 5. click
-  server.tool("click", "Click an element — trusted CDP dispatchMouseEvent with DOM fallback. Use after read_page for ref_N or directly via CSS selector. Args: selector (CSS), by_text (exact visible text), ref (ref_3 from read_page), scope (parent selector), button (left|right|middle), double_click (bool), trusted (true uses CDP isTrusted). Returns mode (cdp-trusted|content|dom-fallback), jsClicked, interceptedBy. For file inputs use type instead.", {
+  // 5. click — coords x/y go straight to trusted CDP; selector path uses content.js then CDP
+  server.tool("click", "Click an element — trusted CDP dispatchMouseEvent with DOM fallback. Use after read_page for ref_N or directly via CSS selector. Args: selector (CSS), by_text (exact visible text), ref (ref_3 from read_page), scope (parent selector), x/y (viewport coords, skips selector), button (left|right|middle), double_click (bool), trusted (true uses CDP isTrusted). Returns mode (cdp-trusted|content|dom-fallback), jsClicked, interceptedBy. For file inputs use type instead. Games/canvas: pass x/y for trusted input.", {
     selector: z.string().optional(),
     double_click: z.boolean().default(false),
     button: z.enum(["left", "right", "middle"]).default("left"),
     by_text: z.string().optional(),
     scope: z.string().optional(),
     ref: z.string().optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
     trusted: z.boolean().default(true),
-  }, guard(async ({ selector, double_click, button, by_text, scope, ref, trusted }) => {
+  }, guard(async ({ selector, double_click, button, by_text, scope, ref, x, y, trusted }) => {
     const result = await performClick(tab(), {
       selector, byText: by_text, scope, ref, button,
-      clickCount: double_click ? 2 : 1, trusted,
+      clickCount: double_click ? 2 : 1, trusted, x, y,
     });
     return json(result);
   }));
@@ -1034,12 +1097,15 @@ export function registerTools(server, ctx) {
     catch { return json(await evalV(tab(), pageFocus, [target])); }
   }));
 
-  // 8. press_key
-  server.tool("press_key", 'Send keyboard shortcut/keys to the focused element (or selector). Args: key (e.g. "Enter", "Tab", "Escape", "Control+a", "Shift+Tab", "Meta+c"), times 1-100 repeats, selector optional (will focus first). Supports modifiers Control/Ctrl, Alt, Shift, Meta/Cmd. Returns pressed count. For typing text, prefer type."', {
+  // 8. press_key — trusted: true routes through CDP Input.dispatchKeyEvent (isTrusted,
+  // required for canvas games / cross-origin iframes like Poki); default content.js synthetic
+  server.tool("press_key", 'Send keyboard shortcut/keys to the focused element (or selector). Args: key (e.g. "Enter", "Tab", "Escape", "Control+a", "Shift+Tab", "Meta+c", "ArrowLeft"), times 1-100 repeats, selector optional (will focus first), trusted bool (true = CDP isTrusted events, use for games/canvas/iframes). Supports modifiers Control/Ctrl, Alt, Shift, Meta/Cmd. Returns pressed count. For typing text, prefer type."', {
     key: z.string(),
     times: z.number().int().min(1).max(100).default(1),
     selector: z.string().optional(),
-  }, guard(async ({ key, times, selector }) => {
+    trusted: z.boolean().default(false),
+  }, guard(async ({ key, times, selector, trusted }) => {
+    if (trusted) return json(await performTrustedKey(tab(), key, times));
     return json(await performPressKey(tab(), { key, times, selector }));
   }));
 
@@ -1935,7 +2001,7 @@ export function registerTools(server, ctx) {
           delayPerChar: a.action === "type" ? a.delay : 0,
         }));
       case "key":
-        return json(await performPressKey(tabId, { key: a.key || "Enter", times: 1, selector: a.selector }));
+        return json(await performTrustedKey(tabId, a.key || "Enter", 1));
       case "scroll":
         return json(await performScroll(tabId, { direction: a.scroll_direction, amount: a.scroll_amount, selector: a.selector, scope: a.scope }));
       case "wait": {
@@ -1956,10 +2022,10 @@ export function registerTools(server, ctx) {
   }));
 
   // 41. health
-  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.12, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
+  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.13, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
     const state = await bridge.browser.state().catch(() => null);
     return json({
-      server: "browser-navigator v2.0.12",
+      server: "browser-navigator v2.0.13",
       connected: !!state,
       transport: bridge.transportName(),
       wsPort,
