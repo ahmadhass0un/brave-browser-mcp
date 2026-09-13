@@ -47,7 +47,7 @@ try {
 // ============================================================================
 
 const PROTOCOL_VERSION = 1;
-const EXT_VERSION = "2.0.13";
+const EXT_VERSION = "2.0.14";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
 const SERVER_PROBE_INTERVAL_MS = 2_000; // poll for the MCP server while it's down
 
@@ -896,6 +896,8 @@ async function acquireDebugger(tabId) {
     dbgTabs.set(tabId, st);
   }
   if (st.refs === 0 && !attaching.has(tabId)) {
+    // cancel any pending linger — we're re-acquiring before the detach fired
+    if (st.lingerTimer) { clearTimeout(st.lingerTimer); st.lingerTimer = null; }
     const attachP = new Promise((resolve, reject) => {
       chrome.debugger.attach({ tabId }, "1.3", () => {
         const e = chrome.runtime.lastError;
@@ -934,11 +936,19 @@ function releaseDebugger(tabId) {
   if (!st) return;
   st.refs -= 1;
   if (st.refs > 0) return;
-  dbgTabs.delete(tabId);
-  try { chrome.debugger.detach({ tabId }, () => void chrome.runtime.lastError); } catch { /* noop */ }
+  // LINGER: rapid attach/detach cycles crash the SW and spam "detached" events.
+  // Keep the debugger attached briefly so back-to-back input storms (games,
+  // sweeps) reuse one attach. Any new acquire within the window cancels the timer.
+  st.lingerTimer = setTimeout(() => {
+    const cur = dbgTabs.get(tabId);
+    if (!cur || cur.refs > 0) return;
+    dbgTabs.delete(tabId);
+    try { chrome.debugger.detach({ tabId }, () => void chrome.runtime.lastError); } catch { /* noop */ }
+  }, 10_000);
+  st.lingerTimer.unref?.();
 }
 
-/** Run fn(tabId) with the debugger attached; detaches when the last ref drops. */
+/** Run fn(tabId) with the debugger attached; detaches when the last ref drops (after linger). */
 async function withDebugger(tabId, fn) {
   await acquireDebugger(tabId);
   try {
@@ -1076,22 +1086,14 @@ function netOnDebuggerEvent(method, params) {
   const cap = netCapture;
   if (!cap) return;
   switch (method) {
+    // (Fetch.requestPaused removed: passive Network-only capture — Fetch.enable
+    //  paused every request and stalled page loads; kept handler no-op for safety
+    //  in case an old session is still attached.)
     case "Fetch.requestPaused": {
-      const r = params.request || {};
-      const isStatic = !cap.includeStatic && isStaticUrl(r.url || "");
-      if (!isStatic) {
-        Object.assign(ensureNetEntry(cap, params.requestId), {
-          method: r.method || null,
-          url: r.url || null,
-          requestHeaders: r.headers || null,
-          postData: typeof r.postData === "string" ? r.postData.slice(0, 2048) : null,
-          state: "requested",
-        });
-      }
       cdpQuiet(cap.tabId, "Fetch.continueRequest", { requestId: params.requestId }); // never stall traffic
       break;
     }
-    case "Network.requestWillBeSent": { // safety net for requests Fetch didn't pause
+    case "Network.requestWillBeSent": {
       if (cap.byReq.has(params.requestId)) break;
       if (!cap.includeStatic && isStaticUrl(params.request?.url || "")) break;
       Object.assign(ensureNetEntry(cap, params.requestId), {
@@ -1145,10 +1147,11 @@ async function startNetCapture(tabId, { maxTimeMs, includeStatic }) {
   if (netCapture) await finalizeCapture("superseded");
   await acquireDebugger(tabId); // held for the whole capture window
   try {
+    // PASSIVE capture: Network domain only. Fetch.enable pauses every request at
+    // the Request stage (urlPattern "*") which stalls page loads (game assets on
+    // Poki froze in "loading") and floods the SW with requestPaused events until
+    // it crashes. Network.* events are pure observers — zero traffic impact.
     await cdpSend(tabId, "Network.enable", {});
-    await cdpSend(tabId, "Fetch.enable", {
-      patterns: [{ urlPattern: "*", requestStage: "Request" }],
-    });
   } catch (e) {
     releaseDebugger(tabId);
     throw e;
@@ -1179,7 +1182,6 @@ async function finalizeCapture(reason) {
   netCapture = null;
   clearTimeout(cap.timer);
   dbgTabs.get(cap.tabId)?.listeners.delete(cap.listener);
-  try { await cdpSend(cap.tabId, "Fetch.disable", {}); } catch { /* detached */ }
   try { await cdpSend(cap.tabId, "Network.disable", {}); } catch { /* detached */ }
   releaseDebugger(cap.tabId);
   cap.entries.sort((a, b) => a.ts - b.ts);
