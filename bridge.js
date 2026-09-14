@@ -192,10 +192,11 @@ export function onTransportMessage(env) {
   }
   if (env.type !== "res" && env.type !== "evt") return;
   if (env.type === "res") {
-    const entry = pending.get(String(env.id));
+    const key = String(env.id);
+    const entry = pending.get(key);
     if (!entry) { log("stale/duplicate res ignored:", env.id); return; }
     clearTimeout(entry.timer);
-    pending.delete(env.id);
+    pending.delete(key);
     if (env.ok) {
       entry.resolve(env.result ?? {});
     } else {
@@ -272,7 +273,6 @@ export let currentTabId = null;
 export let currentWindowId = null;
 
 export function setCurrentTab(tabId, windowId = null) {
-  if (tabId != null && String(tabId).includes("_")) { /* ignore weird */ }
   const changed = currentTabId !== (tabId ?? null);
   currentTabId = tabId ?? null;
   currentWindowId = windowId ?? null;
@@ -325,6 +325,16 @@ export const dbg = {
     call("dbg.cmd", { tabId, method, params }, opts),
 };
 
+export const input = {
+  /** Atomic trusted click — press+release in one debugger attach (tap-plugin safe). */
+  click: (tabId, x, y, opts = {}) =>
+    call("input.click", { tabId, x, y, ...opts }),
+  mouse: (tabId, params = {}, opts = {}) =>
+    call("input.mouse", { tabId, ...params }, opts),
+  key: (tabId, params = {}, opts = {}) =>
+    call("input.key", { tabId, ...params }, opts),
+};
+
 export const history = {
   navigate: (tabId, delta) => call("history.navigate", { tabId, delta }),
 };
@@ -354,6 +364,7 @@ export const net = {
 export const cookies = {
   all: (filter = {}) => call("cookie.all", filter),
   set: (cookie) => call("cookie.set", { cookie }),
+  remove: (args = {}) => call("cookie.remove", args),
 };
 
 export const injected = {

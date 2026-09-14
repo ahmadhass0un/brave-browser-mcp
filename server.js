@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { start as startWsServer } from './ws-server.js';
 import * as bridge from './bridge.js';
@@ -16,8 +16,12 @@ let browsingHistory = [];
 function loadJson(file, fallback) {
   try { return JSON.parse(readFileSync(file, 'utf8')); } catch (e) {
     if (e?.code === 'ENOENT') return fallback;
+    // Corrupt JSON should not kill the server: back it up and start fresh.
     console.error(`[server] loadJson failed for ${file}:`, e?.message || e);
-    throw e;
+    try {
+      if (existsSync(file)) renameSync(file, `${file}.corrupt.${Date.now()}.bak`);
+    } catch {}
+    return fallback;
   }
 }
 function saveJson(file, data) {
@@ -49,12 +53,12 @@ export async function main() {
 
   const server = new McpServer({
     name: 'browser-navigator',
-    version: '2.0.17',
+    version: '2.0.18',
   });
 
   registerTools(server, { bookmarks, browsingHistory, addHistoryEntry, saveBookmarks, saveHistory, wsPort });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`browser-navigator MCP server v2.0.17 started (stdio + ws:${wsPort}), ${bookmarks.length} bookmarks, ${browsingHistory.length} history entries`);
+  console.error(`browser-navigator MCP server v2.0.18 started (stdio + ws:${wsPort}), ${bookmarks.length} bookmarks, ${browsingHistory.length} history entries`);
 }

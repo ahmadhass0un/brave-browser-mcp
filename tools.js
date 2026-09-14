@@ -1,6 +1,6 @@
 /**
  * browser-navigator — tools.js
- * Registers all 43 MCP tools on an McpServer instance. v2.0.17 CSP-safe.
+ * Registers all 43 MCP tools on an McpServer instance. v2.0.18 CSP-safe.
  */
 
 import { z } from "zod";
@@ -725,16 +725,13 @@ export function registerTools(server, ctx) {
       ? resolveTarget({ selector, by_text: byText, scope, ref })
       : null;
 
-    // Coords path: go straight to trusted CDP input (games, canvas, coordinate clicks)
+    // Coords path: atomic trusted CDP click (games, canvas, coordinate clicks).
+    // press+release in ONE debugger attach — tap-plugins (jQuery tap/fastclick,
+    // TIME_DELTA ~400ms) reject clicks whose mouseup lags by a WS round-trip.
     if (hasCoords) {
       if (trusted) {
-        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
-          { type: "mouseMoved", x, y, button: "none", clickCount: 0, pointerType: "mouse" }, { timeoutMs: 8000 });
-        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
-          { type: "mousePressed", x, y, button, clickCount, pointerType: "mouse" });
-        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
-          { type: "mouseReleased", x, y, button, clickCount, pointerType: "mouse" });
-        return { ok: true, mode: "cdp-trusted", x, y, button, clickCount };
+        const r = await bridge.input.click(tabId, x, y, { button, clickCount });
+        return { ok: true, mode: "cdp-trusted", atomic: true, x, y, button, clickCount, sent: r?.sent };
       }
       return { ok: true, mode: "coords-only", x, y };
     }
@@ -763,15 +760,10 @@ export function registerTools(server, ctx) {
 
     if (trusted) {
       try {
-        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
-          { type: "mouseMoved", x: pt.x, y: pt.y, button, clickCount: 0, pointerType: "mouse" }, { timeoutMs: 8000 });
-        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
-          { type: "mousePressed", x: pt.x, y: pt.y, button, clickCount, pointerType: "mouse" });
-        await bridge.dbg.command(tabId, "Input.dispatchMouseEvent",
-          { type: "mouseReleased", x: pt.x, y: pt.y, button, clickCount, pointerType: "mouse" });
+        const r = await bridge.input.click(tabId, pt.x, pt.y, { button, clickCount });
         return {
-          ok: true, mode: "cdp-trusted", x: pt.x, y: pt.y, button, clickCount,
-          target: targetLabel(target), tag: pt.tag ?? null, name: pt.name ?? null,
+          ok: true, mode: "cdp-trusted", atomic: true, x: pt.x, y: pt.y, button, clickCount,
+          target: targetLabel(target), tag: pt.tag ?? null, name: pt.name ?? null, sent: r?.sent,
         };
       } catch (e) {
         const fb = await bridge.dom.clickElement(tabId, target);
@@ -786,22 +778,26 @@ export function registerTools(server, ctx) {
   async function performTrustedKey(tabId, key, times = 1) {
     const SPECIAL = {
       enter: ["Enter", "Enter", 13], tab: ["Tab", "Tab", 9],
-      escape: ["Escape", "Escape", 27], backspace: ["Backspace", "Backspace", 8],
-      delete: ["Delete", "Delete", 46],
+      escape: ["Escape", "Escape", 27], esc: ["Escape", "Escape", 27],
+      backspace: ["Backspace", "Backspace", 8],
+      delete: ["Delete", "Delete", 46], del: ["Delete", "Delete", 46],
+      insert: ["Insert", "Insert", 45],
+      home: ["Home", "Home", 36], end: ["End", "End", 35],
+      pageup: ["PageUp", "PageUp", 33], pagedown: ["PageDown", "PageDown", 34],
       arrowup: ["ArrowUp", "ArrowUp", 38], arrowdown: ["ArrowDown", "ArrowDown", 40],
       arrowleft: ["ArrowLeft", "ArrowLeft", 37], arrowright: ["ArrowRight", "ArrowRight", 39],
       up: ["ArrowUp", "ArrowUp", 38], down: ["ArrowDown", "ArrowDown", 40],
       left: ["ArrowLeft", "ArrowLeft", 37], right: ["ArrowRight", "ArrowRight", 39],
-      space: [" ", "Space", 32],
+      space: [" ", "Space", 32], spacebar: [" ", "Space", 32],
     };
     const parts = String(key).split("+").map((p) => p.trim()).filter(Boolean);
     const keyName = parts.pop() ?? "";
     const mods = parts.reduce((m, p) => {
       const l = p.toLowerCase();
-      if (l === "shift") m.shift = 1;
-      else if (l === "ctrl" || l === "control") m.ctrl = 1;
-      else if (l === "alt" || l === "option") m.alt = 1;
-      else if (l === "meta" || l === "cmd" || l === "command") m.meta = 1;
+      if (l === "shift") m.shift = true;
+      else if (l === "ctrl" || l === "control") m.ctrl = true;
+      else if (l === "alt" || l === "option") m.alt = true;
+      else if (l === "meta" || l === "cmd" || l === "command") m.meta = true;
       return m;
     }, {});
     const lower = keyName.toLowerCase();
@@ -811,17 +807,19 @@ export function registerTools(server, ctx) {
       k = keyName;
       code = /^[a-z]$/i.test(keyName) ? "Key" + keyName.toUpperCase() : /^[0-9]$/.test(keyName) ? "Digit" + keyName : "Unidentified";
       vk = keyName.toUpperCase().charCodeAt(0) || 0;
-      if (/[A-Z]/.test(keyName)) mods.shift = 1;
+      if (/[A-Z]/.test(keyName)) mods.shift = true;
     } else { k = keyName; code = "Unidentified"; vk = 0; }
+    // CDP Input.dispatchKeyEvent modifiers bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8
+    const modifiers = (mods.alt ? 1 : 0) | (mods.ctrl ? 2 : 0) | (mods.meta ? 4 : 0) | (mods.shift ? 8 : 0);
     for (let i = 0; i < times; i++) {
       await bridge.dbg.command(tabId, "Input.dispatchKeyEvent",
-        { type: "keyDown", key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: (mods.ctrl||0)|(mods.shift||0)|(mods.alt||0)|(mods.meta||0) });
+        { type: "keyDown", key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers });
       if (k.length === 1) {
         await bridge.dbg.command(tabId, "Input.dispatchKeyEvent",
-          { type: "char", key: k, code, text: k, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: (mods.ctrl||0)|(mods.shift||0)|(mods.alt||0)|(mods.meta||0) });
+          { type: "char", key: k, code, text: k, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers });
       }
       await bridge.dbg.command(tabId, "Input.dispatchKeyEvent",
-        { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers: (mods.ctrl||0)|(mods.shift||0)|(mods.alt||0)|(mods.meta||0) });
+        { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers });
     }
     return { pressed: times, key, mode: "cdp-trusted" };
   }
@@ -1051,7 +1049,7 @@ export function registerTools(server, ctx) {
   }));
 
   // 5. click — coords x/y go straight to trusted CDP; selector path uses content.js then CDP
-  server.tool("click", "Click an element — trusted CDP dispatchMouseEvent with DOM fallback. Use after read_page for ref_N or directly via CSS selector. Args: selector (CSS), by_text (exact visible text), ref (ref_3 from read_page), scope (parent selector), x/y (viewport coords, skips selector), button (left|right|middle), double_click (bool), trusted (true uses CDP isTrusted). Returns mode (cdp-trusted|content|dom-fallback), jsClicked, interceptedBy. For file inputs use type instead. Games/canvas: pass x/y for trusted input.", {
+  server.tool("click", "Click an element — trusted CDP atomic click (move+press+release in ONE debugger attach, so tap-plugins like jQuery tap/fastclick always register the click) with DOM fallback. Use after read_page for ref_N or directly via CSS selector. Args: selector (CSS), by_text (exact visible text), ref (ref_3 from read_page), scope (parent selector), x/y (viewport coords, skips selector), button (left|right|middle), double_click (bool), trusted (true uses CDP isTrusted). Returns mode (cdp-trusted|content|dom-fallback), atomic, jsClicked, interceptedBy. For file inputs use type instead. Games/canvas: pass x/y for trusted input.", {
     selector: z.string().optional(),
     double_click: z.boolean().default(false),
     button: z.enum(["left", "right", "middle"]).default("left"),
@@ -1471,8 +1469,13 @@ export function registerTools(server, ctx) {
     if (selectorStr) {
       try {
         const c = await contentExec(tab(), "waitForSelector", { selector: selectorStr, timeoutMs: timeout_ms });
-        return json({ ok: true, found: !!c.found, selector: selectorStr, elapsedMs: 0, via: "content" });
-      } catch {}
+        if (!c?.found) throw new Error(`wait_for timed out after ${timeout_ms}ms: ${selectorStr}`);
+        return json({ ok: true, found: true, selector: selectorStr, elapsedMs: 0, via: "content" });
+      } catch (e) {
+        // Content path missing/blocked → fall through to cs.eval bridge below.
+        // But a definitive timeout from content should stay a timeout error.
+        if (e?.message?.includes("timed out after")) throw e;
+      }
     }
     return json(await bridge.dom.waitFor(tab(), target, { timeoutMs: timeout_ms, intervalMs: interval_ms }));
   }));
@@ -1507,9 +1510,10 @@ export function registerTools(server, ctx) {
         break;
       case "open": {
         if (!url) throw new Error('tabs action=open requires "url"');
-        result = await bridge.tabs.open(url, { active: !background, windowId: window_id });
+        const shouldActivate = background ? false : active;
+        result = await bridge.tabs.open(url, { active: shouldActivate, background, windowId: window_id });
         const openedTab = result?.tab;
-        if (openedTab?.id != null && !background) {
+        if (openedTab?.id != null && shouldActivate) {
           bridge.setCurrentTab(openedTab.id, openedTab.windowId ?? null);
         }
         break;
@@ -1581,7 +1585,9 @@ export function registerTools(server, ctx) {
     value: z.union([z.number(), z.string()]).optional(),
   }, guard(async ({ action, value }) => {
     const tabId = await ensureTab();
-    const CONTENT_MAP = { play: "play", pause: "pause", toggle: "pause", mute: "mute", unmute: "unmute", seek: "seek", set_volume: "volume", set_speed: "rate", fullscreen: "fullscreen" };
+    // Only route actions natively supported by content.js videoControl.
+    // toggle/rate are NOT supported there — they must fall through to bridge.dom.videoControl.
+    const CONTENT_MAP = { play: "play", pause: "pause", mute: "mute", unmute: "unmute", seek: "seek", set_volume: "volume", fullscreen: "fullscreen" };
     if (action in CONTENT_MAP) {
       try {
         const cAction = CONTENT_MAP[action];
@@ -1807,16 +1813,23 @@ export function registerTools(server, ctx) {
         for (const c of targets) {
           const scheme = c.secure ? "https" : "http";
           const host = String(c.domain || "").replace(/^\./, "");
+          if (!host || !c.name) continue;
           const cookieUrl = `${scheme}://${host}${c.path || "/"}`;
           try {
-            await bridge.cookies.set({
-              name: c.name,
-              value: "",
-              url: cookieUrl,
-              expirationDate: Math.floor(Date.now() / 1000) - 1,
-            });
+            await bridge.cookies.remove({ name: c.name, url: cookieUrl, storeId: c.storeId });
             cleared += 1;
-          } catch { /* leave it */ }
+          } catch {
+            // Fallback for older extensions without cookie.remove: expire it.
+            try {
+              await bridge.cookies.set({
+                name: c.name,
+                value: "",
+                url: cookieUrl,
+                expirationDate: Math.floor(Date.now() / 1000) - 1,
+              });
+              cleared += 1;
+            } catch { /* leave it */ }
+          }
         }
         return json({ ok: true, action, cleared, attempted: targets.length, backup });
       }
@@ -1825,9 +1838,18 @@ export function registerTools(server, ctx) {
         return json({ ok: true, exported: snap.count, savedTo: snap.file, note: "values are AES-256-GCM encrypted at rest" });
       }
       case "import": {
-        let p = file
-          ? (isAbsolute(file) ? file : join(COOKIES_DIR, file))
-          : readdirSync(COOKIES_DIR).filter((f) => f.endsWith(".json.enc")).sort().map((f) => join(COOKIES_DIR, f)).pop();
+        let p;
+        if (file) {
+          p = isAbsolute(file) ? file : join(COOKIES_DIR, file);
+        } else {
+          let files = [];
+          try {
+            files = readdirSync(COOKIES_DIR).filter((f) => f.endsWith(".json.enc")).sort();
+          } catch (e) {
+            if (e?.code !== "ENOENT") throw e;
+          }
+          p = files.map((f) => join(COOKIES_DIR, f)).pop();
+        }
         if (!p) throw new Error(`No snapshot found in ${COOKIES_DIR}. Run cookies export first or pass "file".`);
         {
           const resolved = resolve(p);
@@ -1898,9 +1920,9 @@ export function registerTools(server, ctx) {
     const q = query.trim().toLowerCase();
     if (q) {
       results = results.filter((b) =>
-        b.title.toLowerCase().includes(q)
-        || b.url.toLowerCase().includes(q)
-        || (b.tags || []).some((t) => t.includes(q)));
+        String(b.title || "").toLowerCase().includes(q)
+        || String(b.url || "").toLowerCase().includes(q)
+        || (b.tags || []).some((t) => String(t || "").toLowerCase().includes(q)));
     }
     const wantedTags = tags.map((t) => t.trim().toLowerCase()).filter(Boolean);
     if (wantedTags.length) {
@@ -1922,12 +1944,12 @@ export function registerTools(server, ctx) {
     limit: z.number().int().min(1).max(500).default(50),
   }, guard(async ({ query, hours, limit }) => {
     const cutoff = Date.now() - hours * 3600000;
-    let results = browsingHistory.filter((h) => h.timestamp > cutoff);
+    let results = browsingHistory.filter((h) => (h?.timestamp ?? 0) > cutoff);
     const q = query.trim().toLowerCase();
     if (q) {
       results = results.filter((h) =>
-        (h.title || "").toLowerCase().includes(q)
-        || h.url.toLowerCase().includes(q));
+        String(h.title || "").toLowerCase().includes(q)
+        || String(h.url || "").toLowerCase().includes(q));
     }
     return json(results.length ? results.slice(0, limit) : "No history found.");
   }));
@@ -1978,6 +2000,7 @@ export function registerTools(server, ctx) {
           y: a.y,
           button: a.action === "right_click" ? "right" : a.button,
           clickCount: a.action === "double_click" ? 2 : 1,
+          trusted: true, // atomic CDP click — tap-plugins need press+release in one attach
         }));
       case "move":
       case "hover": {
@@ -2012,7 +2035,9 @@ export function registerTools(server, ctx) {
       case "navigate": {
         if (!a.url) throw new Error('computer action=navigate requires "url"');
         assertSafeUrl(a.url);
-        return json(await bridge.nav.goto(a.url, { waitUntil: "load", timeoutMs: 30000, width: a.width, height: a.height, background: a.background }));
+        const result = await bridge.nav.goto(a.url, { tabId, waitUntil: "load", timeoutMs: 30000, width: a.width, height: a.height, background: a.background });
+        try { addHistoryEntry({ url: a.url, title: result?.title || a.url, tabId }); } catch {}
+        return json(result);
       }
       case "screenshot":
         return json(await capturePng(tabId, { fullPage: false, selector: a.selector }));
@@ -2022,10 +2047,10 @@ export function registerTools(server, ctx) {
   }));
 
   // 41. health
-  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.17, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
+  server.tool("health", "Server health probe: no browser needed. Returns server v2.0.18, connected bool, transport (websocket|null), wsPort, uptimeSec, browser {windows,tabs,activeTabId,extVersion}, currentTabId, liveRefs (refMap size), bookmarks/history counts. Call anytime to check readiness.", {}, guard(async () => {
     const state = await bridge.browser.state().catch(() => null);
     return json({
-      server: "browser-navigator v2.0.17",
+      server: "browser-navigator v2.0.18",
       connected: !!state,
       transport: bridge.transportName(),
       wsPort,

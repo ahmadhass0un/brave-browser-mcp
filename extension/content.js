@@ -341,6 +341,8 @@
       label = normWs(el.textContent || '');
     }
     if (!label && el instanceof HTMLInputElement) label = normWs(el.value || el.placeholder || '');
+    if (!label && el instanceof HTMLImageElement) label = normWs(el.alt || el.title || '');
+    if (!label && el.tagName === 'IMG') label = normWs(el.getAttribute('alt') || el.getAttribute('title') || '');
     return label.slice(0, 120);
   }
 
@@ -355,6 +357,7 @@
       role: el.getAttribute('role') || '',
     };
     if (tag === 'a') item.href = el.href || el.getAttribute('href') || '';
+    if (tag === 'img') item.alt = normWs(el.getAttribute('alt') || '').slice(0, 120);
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
       item.value = String(el.value || '').slice(0, 120);
     }
@@ -384,7 +387,7 @@
       if (!vis(el)) continue;
       const item = describeInteractive(el);
       if (needle) {
-        const haystack = [item.text, item.ariaLabel, item.value || ''].join('\n').toLowerCase();
+        const haystack = [item.text, item.ariaLabel, item.value || '', item.href || '', item.alt || ''].join('\n').toLowerCase();
         if (!haystack.includes(needle)) continue;
       }
       elements.push(item);
@@ -826,10 +829,20 @@
         case 'pause':
           video.pause();
           break;
+        case 'toggle':
+          if (video.paused) await video.play();
+          else video.pause();
+          break;
         case 'seek': {
           const t = Number(args.value);
           if (!Number.isFinite(t) || t < 0) throw fail('seek needs numeric "value" (seconds)');
           video.currentTime = Number.isFinite(video.duration) && t > video.duration ? video.duration : t;
+          break;
+        }
+        case 'rate': {
+          const r = Number(args.value);
+          if (!Number.isFinite(r) || r <= 0 || r > 16) throw fail('rate needs "value" between 0 and 16');
+          video.playbackRate = r;
           break;
         }
         case 'volume': {
@@ -850,7 +863,7 @@
           await video.requestFullscreen();
           break;
         default:
-          throw fail(`unknown action "${action}" (play|pause|seek|volume|mute|unmute|fullscreen)`);
+          throw fail(`unknown action "${action}" (play|pause|toggle|seek|rate|volume|mute|unmute|fullscreen)`);
       }
     } catch (e) {
       success = false;

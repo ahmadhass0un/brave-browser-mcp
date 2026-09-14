@@ -47,7 +47,7 @@ try {
 // ============================================================================
 
 const PROTOCOL_VERSION = 1;
-const EXT_VERSION = "2.0.17";
+const EXT_VERSION = "2.0.18";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
 const SERVER_PROBE_INTERVAL_MS = 2_000; // poll for the MCP server while it's down
 
@@ -823,6 +823,7 @@ const HANDLERS = {
 
   // Trusted input (CDP Input domain)
   "input.mouse": hInputMouse,
+  "input.click": hInputClick,
   "input.key": hInputKey,
 
   // Network capture
@@ -836,6 +837,7 @@ const HANDLERS = {
   // Cookies
   "cookie.all": hCookieAll,
   "cookie.set": hCookieSet,
+  "cookie.remove": hCookieRemove,
 
   // Injected scripts
   "injected.register": hInjectedRegister,
@@ -1893,6 +1895,32 @@ async function hInputMouse(args) {
   return ok({ sent: true, input: params });
 }
 
+/** Atomic trusted click: move+press+release inside ONE debugger session.
+ *  Games using tap-plugins (jQuery tap, fastclick) require mouseup within
+ *  TIME_DELTA (often 400ms) of mousedown — separate WS round-trips can exceed
+ *  that under SW cold-start, leaving the button "held". Press+release in one
+ *  attach guarantees the tap fires. */
+async function hInputClick(args) {
+  const tabId = reqNum(args, "tabId");
+  const x = reqNum(args, "x");
+  const y = reqNum(args, "y");
+  const button = ["left", "middle", "right"].includes(args.button) ? args.button : "left";
+  const clickCount = optNum(args, "clickCount", 1, 1, 5);
+  const modifiers = parseModifiers(args.modifiers);
+  await getTabOrThrow(tabId);
+  await withDebugger(tabId, async (t) => {
+    if (args.move !== false) {
+      await cdpSend(t, "Input.dispatchMouseEvent",
+        { type: "mouseMoved", x, y, button: "none", clickCount: 0, pointerType: "mouse", modifiers });
+    }
+    await cdpSend(t, "Input.dispatchMouseEvent",
+      { type: "mousePressed", x, y, button, clickCount, pointerType: "mouse", modifiers });
+    await cdpSend(t, "Input.dispatchMouseEvent",
+      { type: "mouseReleased", x, y, button, clickCount, pointerType: "mouse", modifiers });
+  });
+  return ok({ sent: true, atomic: true, x, y, button, clickCount });
+}
+
 async function hInputKey(args) {
   const tabId = reqNum(args, "tabId");
   const type = optStr(args, "type");
@@ -2122,6 +2150,25 @@ async function hCookieSet(args) {
     .catch((e) => { throw mapChromeError(e); });
   if (!stored) throw rpcErr(ERR.INTERNAL, "cookies.set rejected the cookie (check url/domain/path)");
   return ok({ set: true, cookie: stored });
+}
+
+async function hCookieRemove(args) {
+  const name = optStr(args, "name");
+  if (!name) throw rpcErr(ERR.BAD_REQUEST, 'cookie.remove requires "name"');
+  let url = optStr(args, "url");
+  if (!url) {
+    const domain = optStr(args, "domain");
+    const path = optStr(args, "path") || "/";
+    if (!domain) throw rpcErr(ERR.BAD_REQUEST, 'cookie.remove requires "url" or "domain"');
+    const scheme = args.secure === true ? "https" : "http";
+    url = `${scheme}://${String(domain).replace(/^\./, "")}${path}`;
+  }
+  const details = { url, name };
+  const storeId = optStr(args, "storeId");
+  if (storeId) details.storeId = storeId;
+  const removed = await cbp(chrome.cookies.remove.bind(chrome.cookies), details)
+    .catch((e) => { throw mapChromeError(e); });
+  return ok({ removed: !!removed, name, url });
 }
 
 // ---- Injected scripts ----------------------------------------------------------------------

@@ -14,7 +14,7 @@ Built so that an LLM can operate **complex, dynamic UIs** (dialogs, modals, drop
 - 🔐 **CAPTCHA detection** — detects reCAPTCHA, hCaptcha, Cloudflare Turnstile & challenges, pauses automation, and waits for a human
 - 🍪 **Session persistence** — save/load cookies via `chrome.cookies` (encrypted), `data/` JSON stores
 - 🎥 **Video control** — play/pause/seek/volume/mute on any HTML5 player
-- 🔍 **Search** — `search` across 9 platforms (Google, Bing, DDG, Brave, YouTube, Reddit, GitHub, SO, Wikipedia) + `search_tabs` (TF‑IDF) over open tabs
+- 🔍 **Social search** — `search` + `search_tabs` (TF‑IDF) across 9 platforms
 - 📄 **Export** — screenshots (`Page.captureScreenshot` + `captureVisibleTab`) and PDF (`Page.printToPDF`) to `data/screenshots/`
 - 🔧 **Arbitrary JS** — `execute_js` (wrapped `async () => (code)`, requires `confirm=true`)
 - 🏥 **Health check** — server + extension transport state (`waiting`/`connected`), window/tab counts
@@ -108,14 +108,14 @@ All 43 tools (via `tools.js` → `bridge.js` → `background.js` ops):
 | `scroll` | Scroll up/down/left/right (pixel amount) |
 | `hover` | Hover to reveal menus and tooltips |
 | `get_page_info` | URL, title, load status, CAPTCHA presence |
-| `get_page_content` | Extract visible text or raw HTML (limit 100–200000, default 10000) |
+| `get_page_content` | Extract visible text or raw HTML (10k char cap) |
 | `read_page` | Accessibility tree with stable ref IDs (ref_1, ref_2...); filter interactive/all |
 | `list_elements` | List interactive elements with reusable CSS selectors |
 | `inspect_dom` | Inspect an element's structure, attributes, and children |
 | `screenshot` | PNG of the page or an element (saved under `screenshots/`) |
 | `pdf_export` | Save the page as a PDF (saved under `screenshots/`) |
 | `execute_js` | Run arbitrary JS in the page (requires `confirm=true`) |
-| `inject_script` | Inject persistent MAIN-world content script (survives navigations) |
+| `inject_script` | Inject persistent content script (survives navigations, isolated world) |
 | `send_to_injected` | Send message to injected script and await reply |
 | `wait_for` | Wait until an element appears in the DOM |
 | `wait_for_load` | Wait for full page load |
@@ -125,10 +125,10 @@ All 43 tools (via `tools.js` → `bridge.js` → `background.js` ops):
 | `network_request` | Send custom HTTP request through browser (cookies apply) |
 | `search_tabs` | Semantic search across ALL open tabs (TF-IDF cosine similarity) |
 | `tabs` | List / open / switch / close tabs (background mode supported) |
-| `windows` | List / focus / close windows |
+| `windows` | List / switch / close windows |
 | `detect_captcha` | Check CAPTCHA presence & solved status |
 | `wait_for_captcha` | Poll until the user solves a CAPTCHA |
-| `video_control` | Play/pause/toggle/mute/unmute/seek/speed/volume/fullscreen on HTML5 video |
+| `video_control` | Play/pause/seek/volume/fullscreen on HTML5 video |
 | `search` | Search 9 platforms: Google, Bing, DuckDuckGo, Brave, YouTube, Reddit, GitHub, Stack Overflow, Wikipedia |
 | `bookmark_add` / `bookmark_delete` / `bookmark_search` / `bookmark_list` | Local JSON bookmark store (tags, upsert by url) |
 | `history_search` | Search server-recorded navigation history (time-filtered, persisted, capped 5000) |
