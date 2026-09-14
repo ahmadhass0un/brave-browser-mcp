@@ -47,7 +47,7 @@ try {
 // ============================================================================
 
 const PROTOCOL_VERSION = 1;
-const EXT_VERSION = "2.0.15";
+const EXT_VERSION = "2.0.16";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
 const SERVER_PROBE_INTERVAL_MS = 2_000; // poll for the MCP server while it's down
 
@@ -892,34 +892,43 @@ async function acquireDebugger(tabId) {
   } catch (e) { throw e; }
   let st = dbgTabs.get(tabId);
   if (!st) {
-    st = { refs: 0, pending: new Set(), listeners: new Set() };
+    st = { refs: 0, attached: false, pending: new Set(), listeners: new Set(), lingerTimer: null };
     dbgTabs.set(tabId, st);
   }
   if (st.refs === 0 && !attaching.has(tabId)) {
-    // cancel any pending linger — we're re-acquiring before the detach fired
+    // cancel any pending linger — we're re-acquiring inside the window, and the
+    // debugger is still attached (linger only delays detach, it never detaches).
     if (st.lingerTimer) { clearTimeout(st.lingerTimer); st.lingerTimer = null; }
-    const attachP = new Promise((resolve, reject) => {
-      chrome.debugger.attach({ tabId }, "1.3", () => {
-        const e = chrome.runtime.lastError;
-        if (e) reject(new Error(e.message));
-        else resolve();
+    if (!st.attached) {
+      // Best-effort clear of OUR stale holds (killed server left Fetch/Network
+      // enabled on this tab): detach is a no-op when nobody holds it, and can
+      // never steal a foreign debugger (it only releases this extension's own
+      // session — a foreign hold still fails cleanly below).
+      try { await cbp(chrome.debugger.detach.bind(chrome.debugger), { tabId }); } catch {}
+      const attachP = new Promise((resolve, reject) => {
+        chrome.debugger.attach({ tabId }, "1.3", () => {
+          const e = chrome.runtime.lastError;
+          if (e) reject(new Error(e.message));
+          else resolve();
+        });
       });
-    });
-    const timeoutP = new Promise((_, rej) => setTimeout(() => rej(new Error("Debugger attach timeout after 5s")), 5000));
-    const race = Promise.race([attachP, timeoutP]);
-    attaching.set(tabId, race);
-    try {
-      await race;
-    } catch (e) {
-      // if timeout wins but attachP later succeeds, detach to avoid leak
-      if (String(e.message).includes("timeout")) {
-        attachP.then(() => { try { chrome.debugger.detach({ tabId }, () => void chrome.runtime.lastError); } catch {} }).catch(()=>{});
+      const timeoutP = new Promise((_, rej) => setTimeout(() => rej(new Error("Debugger attach timeout after 5s")), 5000));
+      const race = Promise.race([attachP, timeoutP]);
+      attaching.set(tabId, race);
+      try {
+        await race;
+        st.attached = true;
+      } catch (e) {
+        // if timeout wins but attachP later succeeds, detach to avoid leak
+        if (String(e.message).includes("timeout")) {
+          attachP.then(() => { try { chrome.debugger.detach({ tabId }, () => void chrome.runtime.lastError); } catch {} }).catch(()=>{});
+        }
+        attaching.delete(tabId);
+        if (dbgTabs.get(tabId)?.refs === 0 && !dbgTabs.get(tabId)?.lingerTimer) dbgTabs.delete(tabId);
+        throw mapChromeError(e);
       }
       attaching.delete(tabId);
-      if (dbgTabs.get(tabId)?.refs === 0) dbgTabs.delete(tabId);
-      throw mapChromeError(e);
     }
-    attaching.delete(tabId);
   } else if (attaching.has(tabId)) {
     try {
       await attaching.get(tabId);
@@ -1013,6 +1022,8 @@ chrome.debugger.onDetach.addListener((source) => {
   if (tabId == null) return;
   const st = dbgTabs.get(tabId);
   if (st) {
+    if (st.lingerTimer) { clearTimeout(st.lingerTimer); st.lingerTimer = null; }
+    st.attached = false;
     for (const entry of [...st.pending]) {
       try { if (entry.timer) clearTimeout(entry.timer); } catch {}
       const rej = entry.reject || entry;
