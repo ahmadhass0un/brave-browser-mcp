@@ -47,7 +47,7 @@ try {
 // ============================================================================
 
 const PROTOCOL_VERSION = 1;
-const EXT_VERSION = "2.0.14";
+const EXT_VERSION = "2.0.15";
 const DEFAULT_SERVER_URL = "ws://127.0.0.1:9224";
 const SERVER_PROBE_INTERVAL_MS = 2_000; // poll for the MCP server while it's down
 
@@ -1124,11 +1124,11 @@ function netOnDebuggerEvent(method, params) {
       if (!entry) break;
       entry.state = "finished";
       entry.encodedDataLength = params.encodedDataLength ?? null;
-      cdpQuiet(cap.tabId, "Network.getResponseBody", { requestId: params.requestId })
-        .then((body) => {
-          const d = decodeBodyPreview(body);
-          if (d) { entry.bodyPreview = d.preview; entry.bodyTruncated = d.truncated; }
-        });
+      // LAZY bodies: fetching getResponseBody per request doubles the CDP command
+      // rate (each with its own 8s pending timer) and on game/ad-heavy pages the
+      // event storm burns the SW CPU quota → Chrome kills the SW → WS drops.
+      // Just flag it; fillBodyPreviews() backfills on network_stop/peek (capped).
+      entry.bodyPending = true;
       break;
     }
     case "Network.loadingFailed": {
@@ -1176,12 +1176,33 @@ async function startNetCapture(tabId, { maxTimeMs, includeStatic }) {
   return cap;
 }
 
+/** Backfill response bodies for finished requests — capped count + hard time
+ *  budget, best-effort. Called from network_stop/peek (user explicitly reads),
+ *  never live per-request (that storm killed the SW on busy pages). */
+async function fillBodyPreviews(tabId, entries, max = 60) {
+  const cands = entries.filter((e) => e.bodyPending && !e.bodyPreview).slice(-max);
+  if (!cands.length) return;
+  const st = dbgTabs.get(tabId);
+  if (!st || st.refs === 0) return; // debugger gone — nothing to ask
+  const deadline = nowTs() + 2500;
+  for (const e of cands) {
+    if (nowTs() > deadline) break;
+    try {
+      const body = await cdpSend(tabId, "Network.getResponseBody", { requestId: e.requestId });
+      const d = decodeBodyPreview(body);
+      if (d) { e.bodyPreview = d.preview; e.bodyTruncated = d.truncated; }
+    } catch { /* detached or evicted — skip */ }
+    finally { e.bodyPending = false; }
+  }
+}
+
 async function finalizeCapture(reason) {
   const cap = netCapture;
   if (!cap) return [];
   netCapture = null;
   clearTimeout(cap.timer);
   dbgTabs.get(cap.tabId)?.listeners.delete(cap.listener);
+  await fillBodyPreviews(cap.tabId, cap.entries).catch(() => {});
   try { await cdpSend(cap.tabId, "Network.disable", {}); } catch { /* detached */ }
   releaseDebugger(cap.tabId);
   cap.entries.sort((a, b) => a.ts - b.ts);
@@ -1909,6 +1930,7 @@ async function hNetStop(args) {
 async function hNetPeek(args) {
   if (!netCapture) return ok({ capturing: false, count: 0, requests: [] });
   const snapshot = netCapture.entries.slice().sort((a, b) => a.ts - b.ts);
+  await fillBodyPreviews(netCapture.tabId, snapshot.slice(-20), 20).catch(() => {});
   return ok({
     capturing: true,
     tabId: netCapture.tabId,
