@@ -49,12 +49,12 @@ export async function main() {
 
   const server = new McpServer({
     name: 'browser-navigator',
-    version: '2.0.16',
+    version: '2.0.17',
   });
 
   registerTools(server, { bookmarks, browsingHistory, addHistoryEntry, saveBookmarks, saveHistory, wsPort });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`browser-navigator MCP server v2.0.16 started (stdio + ws:${wsPort}), ${bookmarks.length} bookmarks, ${browsingHistory.length} history entries`);
+  console.error(`browser-navigator MCP server v2.0.17 started (stdio + ws:${wsPort}), ${bookmarks.length} bookmarks, ${browsingHistory.length} history entries`);
 }

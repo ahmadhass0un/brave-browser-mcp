@@ -96,14 +96,19 @@ function invalidatePending(reason) {
   }
 }
 
+/** A new socket is a new session ONLY when it supersedes an OPEN one.
+ *  A reconnect after a close/restart (prev CLOSED/null) should NOT kill
+ *  pending calls — the same extension session continues. */
 export function setWs(ws) {
   const prev = wsTransport;
   if (prev === ws) return;
   wsTransport = ws ?? null;
   if (prev && prev.readyState === WebSocket_OPEN) {
+    // True supersede (e.g. another client): old session dead
     try { prev.close(4002, "superseded"); } catch { /* already gone */ }
+    invalidatePending("transport changed mid-call");
   }
-  invalidatePending("transport changed mid-call");
+  // Reconnect (prev CLOSED/null): keep pending intact — same session, new link.
 }
 
 let shuttingDown = false;
